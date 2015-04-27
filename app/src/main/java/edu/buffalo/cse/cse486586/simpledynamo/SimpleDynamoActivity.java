@@ -1,5 +1,6 @@
 package edu.buffalo.cse.cse486586.simpledynamo;
 
+import android.net.Uri;
 import android.os.Bundle;
 import android.app.Activity;
 import android.text.method.ScrollingMovementMethod;
@@ -8,6 +9,7 @@ import android.view.Menu;
 import android.widget.TextView;
 
 public class SimpleDynamoActivity extends Activity {
+	Uri uri;
 
 	@Override
 	protected void onCreate(Bundle savedInstanceState) {
@@ -16,6 +18,10 @@ public class SimpleDynamoActivity extends Activity {
     
 		TextView tv = (TextView) findViewById(R.id.textView1);
         tv.setMovementMethod(new ScrollingMovementMethod());
+
+
+        /* Build URI */
+		uri = SimpleDynamoProvider.buildUri(SimpleDynamoProvider.URI_SCHEME, SimpleDynamoProvider.URI_AUTHORITY);
 	}
 
 	@Override
