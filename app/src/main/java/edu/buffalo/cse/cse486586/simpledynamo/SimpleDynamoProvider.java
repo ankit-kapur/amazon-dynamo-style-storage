@@ -179,8 +179,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 			/* Wait until the query is answered by ALL */
 			Log.v(TAG, "Waiting for EVERYONE to reply to the '*' query");
-			boolean allDone = true;
+			boolean allDone;
 			do {
+				allDone = true;
 				for (int portNum: PORT_ID_LIST)
 					allDone = allDone && isQueryAnswered.get("*" + "###" + String.valueOf(portNum));
 				/* TODO: Failure scenario: Handle the case when one of the AVDs fails. This could go into an infinite loop */
