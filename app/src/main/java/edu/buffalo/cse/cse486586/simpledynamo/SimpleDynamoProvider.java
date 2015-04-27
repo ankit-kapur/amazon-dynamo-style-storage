@@ -32,23 +32,23 @@ import java.util.TreeMap;
 
 public class SimpleDynamoProvider extends ContentProvider {
 	/* My port number (this device's port number) */
-	int myPortNumber = 0;
+	static int myPortNumber = 0;
 	static String TAG = null;
 
 	/* Keep track of who's alive */
-	Map<Integer, Boolean> whosAlive = new HashMap<>();
-	Map<String, Integer> versionTracker = new HashMap<>();
+	static Map<Integer, Boolean> whosAlive = new HashMap<>();
+	static Map<String, Integer> versionTracker = new HashMap<>();
 
 	Context context;
 	static final int SERVER_PORT = 10000;
-	static final int[] PORT_ID_LIST = {5554, 5556, 5558, 5560, 5562};
+	static final int[] PORT_ID_LIST = {5562, 5556, 5554, 5558, 5560};
 
 	static final String URI_SCHEME = "content";
 	static final String URI_AUTHORITY = "edu.buffalo.cse.cse486586.simpledynamo.provider";
 
 	/* Important stuff */
 	TreeMap<String, Integer> nodeInformation = new TreeMap<>();
-	static int predecessorId = 0, successorId = 0;
+	//static int predecessorId = 0, successorId = 0;
 	static boolean is5554Alive = false;
 
 	/* Key = <query_key###portNumOfTarget> */
@@ -56,8 +56,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 	static Map<String, String> resultOfMyQuery = new HashMap<>();
 
 	/* Map<KEY, List<PORT-ID> */
-	Map<String, List<String>> keysInserted = new HashMap<>();
-	List<String> keysInsertedLocally = new ArrayList<>();
+	static Map<String, List<String>> keysInserted = new HashMap<>();
+	static List<String> keysInsertedLocally = new ArrayList<>();
+	static int numOfKeysInserted = 0;
 
 	@Override
 	public boolean onCreate() {
@@ -88,20 +89,19 @@ public class SimpleDynamoProvider extends ContentProvider {
 		//myHashedId = genHash(String.valueOf(myPortNumber));
 
 		/* Declare self as predecessor and successor */
-		predecessorId = myPortNumber;
-		successorId = myPortNumber;
+		//predecessorId = myPortNumber;
+		//successorId = myPortNumber;
 
 		/* Tag - to be used for all debug/error logs */
 		TAG = "ANKIT-" + myPortNumber;
 
-		if (myPortNumber == 5554) {
-
+		//if (myPortNumber == 5554) {
 			/* Put self in the nodeInformation map */
-			nodeInformation.put(genHash(String.valueOf(myPortNumber)), myPortNumber);
-		} else {
+			//nodeInformation.put(genHash(String.valueOf(myPortNumber)), myPortNumber);
+		//} else {
 			/* Send a join request to 5554 (11108) */
-			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.SEND_JOIN_REQUEST));
-		}
+			//new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.SEND_JOIN_REQUEST));
+		//}
 
 		/* Create a server socket and a thread (AsyncTask) that listens on the server port */
 		try {
@@ -164,7 +164,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		/* Make the cursor */
 		String[] columnNames = {"key", "value"};
 		MatrixCursor matrixCursor = new MatrixCursor(columnNames);
-		Log.d(TAG, "[Query] " + "Query received. Selection ==> " + selection);
+		//Log.d(TAG, "[Query] " + "Query received. Selection ==> " + selection);
 
 		if (selection.equals("\"*\"")) {
 
@@ -178,12 +178,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 			}
 
 			/* Wait until the query is answered by ALL */
+			Log.v(TAG, "Waiting for EVERYONE to reply to the '*' query");
 			boolean allDone = true;
 			do {
 				for (int portNum: PORT_ID_LIST)
 					allDone = allDone && isQueryAnswered.get("*" + "###" + String.valueOf(portNum));
 				/* TODO: Failure scenario: Handle the case when one of the AVDs fails. This could go into an infinite loop */
 			} while (!allDone);
+			Log.v(TAG, "EVERYONE has replied to the '*' query");
 
 			/* The "*" query has been answered by all. Store the results in the cursor and return them. */
 			/* Split up the key-value pairs in "resultOfMyQuery" */
@@ -214,6 +216,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 			/* TODO: Seems like this is all that needs to be done. Check if it needs anything else. */
 			Log.v(TAG, "Query for '@' complete. No. of rows retrieved ==> " + matrixCursor.getCount());
+			Log.v(TAG, "No. of local insertions ==> " + numOfKeysInserted);
 
 		} else {
 			/* ---- Normal key ("selection" is the key) */
@@ -257,9 +260,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 		int coordinatorPortId = whereDoesItBelong(msgKey);
 		int replicaIDs[] = getThreeReplicaIDs(coordinatorPortId, PORT_ID_LIST);
 
+		Log.d(TAG, "[Insert] " + msgKey + " ==> Sending insert request to => " + replicaIDs[0] + ", " + replicaIDs[1] + ", " + replicaIDs[2]);
 		for (int replicaID: replicaIDs) {
-			Log.d(TAG, "[Insert] " + msgKey + " ==> Sending insert request to => " + replicaID);
-			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.INSERT_REQUEST), msgKey, msgValue, replicaID);
+			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.INSERT_REQUEST), msgKey, msgValue, String.valueOf(replicaID));
 
 			/* TODO: Wait for ACKs or until timeout */
 			/* The ACK boolean variable must be specific to msg-key & AVD number
@@ -290,7 +293,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return -1;
 	}
 
-	private boolean doesItBelongHere(String msgKeyHashed, String nodeId) {
+	private boolean doesItBelongHere(String msgKeyHashed, int nodeId) {
 	    /*
 	        Cases:
 	          1. if I am my own successor and predecessor ---> it belongs HERE
@@ -298,10 +301,18 @@ public class SimpleDynamoProvider extends ContentProvider {
 	                a. if msg-key > predecessor OR msg-key < my-key ---> it belongs HERE
 	          3. else if msg-key is between my predecessor and me ---> it belongs HERE
 	     */
-		String myHashedId = genHash(nodeId);
+		String myHashedId = genHash(String.valueOf(nodeId));
 		boolean belongsHere = false;
-		String predecessorHashedId = genHash(predecessorId);
-		String successorHashedId = genHash(successorId);
+
+		/* Find predecessor & sucessor IDs */
+		int nodeIndex = -1;
+		for (int i=0; i< PORT_ID_LIST.length; i++)
+			if (PORT_ID_LIST[i] == nodeId)
+				nodeIndex = i;
+		int predecessorId = PORT_ID_LIST[(nodeIndex > 0) ? (nodeIndex-1) : PORT_ID_LIST.length-1];
+		int successorId = PORT_ID_LIST[(nodeIndex+1) % (PORT_ID_LIST.length)];
+		String predecessorHashedId = genHash(String.valueOf(predecessorId));
+		String successorHashedId = genHash(String.valueOf(successorId));
 
 		if (myHashedId.equals(predecessorHashedId) && myHashedId.equals(successorHashedId))
 			belongsHere = true;
@@ -314,13 +325,13 @@ public class SimpleDynamoProvider extends ContentProvider {
 			/* Normal case. The key is between my predecessor and me */
 			belongsHere = true;
 
-		Log.d(TAG, "[belongsHere = " + belongsHere + "] hashedKey = " + msgKeyHashed + ", predecessor = " + predecessorId + "(" + predecessorHashedId + "), successor = " + successorId + "(" + successorHashedId + ")");
+		//Log.d(TAG, "[belongsHere = " + belongsHere + "] hashedKey = " + msgKeyHashed + ", predecessor = " + predecessorId + "(" + predecessorHashedId + "), successor = " + successorId + "(" + successorHashedId + ")");
 		return belongsHere;
 	}
 
-	private boolean doesItBelongHere(String msgKeyHashed, int nodeId) {
-		return doesItBelongHere(msgKeyHashed, String.valueOf(nodeId));
-	}
+	//private boolean doesItBelongHere(String msgKeyHashed, int nodeId) {
+	//	return doesItBelongHere(msgKeyHashed, String.valueOf(nodeId));
+	//}
 
 
 	@Override
@@ -403,40 +414,38 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 			try {
 				while (true) {
-					Log.d(TAG, "Waiting to accept socket");
 					clientSocket = serverSocket.accept();
-					Log.d(TAG, "Accepted socket");
 
 					BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
 					String incomingString = bufferedReader.readLine();
 
-					Log.d(TAG, "incoming ==> " + incomingString);
+					Log.d(TAG, "Incoming ==> " + incomingString);
 					String incoming[] = incomingString.split("##");
 					Mode mode = Mode.valueOf(incoming[0]);
 
 					switch (mode) {
-						case JOIN_REQUEST: /* 1 */
-							/* --- Got a join request */
-
-							/* Update the nodeInformation list */
-							String sendersActualID1 = incoming[1];
-							nodeInformation.put(genHash(sendersActualID1), Integer.parseInt(sendersActualID1));
-
-							/* Respond to EVERYONE, informing them of their predecessor and successor. */
-							new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.SEND_JOIN_RESPONSE));
-							break;
-
-						case JOIN_RESPONSE: /* 2 */
-							/* --- Got a response from 5554 for the join request I (OR SOMEONE ELSE) had sent */
-							is5554Alive = true;
-							Log.d(TAG, "Got neighbour information from 5554 ==> " + incomingString);
-
-							String IDs2 = incoming[2];
-							String[] parts2 = IDs2.split("%%");
-							predecessorId = Integer.parseInt(parts2[0]);
-							successorId = Integer.parseInt(parts2[1]);
-
-							break;
+						//case JOIN_REQUEST: /* 1 */
+						//	/* --- Got a join request */
+						//
+						//	/* Update the nodeInformation list */
+						//	String sendersActualID1 = incoming[1];
+						//	nodeInformation.put(genHash(sendersActualID1), Integer.parseInt(sendersActualID1));
+						//
+						//	/* Respond to EVERYONE, informing them of their predecessor and successor. */
+						//	new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.SEND_JOIN_RESPONSE));
+						//	break;
+						//
+						//case JOIN_RESPONSE: /* 2 */
+						//	/* --- Got a response from 5554 for the join request I (OR SOMEONE ELSE) had sent */
+						//	is5554Alive = true;
+						//	Log.d(TAG, "Got neighbour information from 5554 ==> " + incomingString);
+						//
+						//	String IDs2 = incoming[2];
+						//	String[] parts2 = IDs2.split("%%");
+						//	predecessorId = Integer.parseInt(parts2[0]);
+						//	successorId = Integer.parseInt(parts2[1]);
+						//
+						//	break;
 
 						case INSERT_REQUEST: /* 3 */
 							/* A request for insertion received.
@@ -450,6 +459,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 							Log.d(TAG, "[Insert] " + msgKey3 + " belongs here. WRITING.");
 							writeToInternalStorage(msgKey3, msgValue3);
 							keysInsertedLocally.add(msgKey3);
+							numOfKeysInserted++;
 
 							/* TODO: Send ACK to originator */
 
@@ -462,7 +472,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 							/* The key is present here. Get it's value and inform the originator */
 							String queryResult4 = readFromInternalStorage(keyToFind4);
-							Log.d(TAG, "[Query] " + keyToFind4 + " ==> does not belong here. Passing on to successor => " + successorId);
+							Log.d(TAG, "[Query] " + keyToFind4 + " ==> belongs here. Sending back value to originator => " + originatorPortId4);
 
 							String messageToBeSent4 = Mode.QUERY_RESULT_FOUND.toString() + "##" + keyToFind4 + "##" + queryResult4 + "##" + String.valueOf(myPortNumber);
 							sendOnSocket(messageToBeSent4, Integer.parseInt(originatorPortId4) * 2);
@@ -549,33 +559,33 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 			switch (mode) {
 
-				case SEND_JOIN_REQUEST: /* 1 */
-					/* Send join request to 5554 */
-					int destinationPortId1 = 5554 * 2;
-					String messageToBeSent1 = Mode.JOIN_REQUEST.toString() + "##" + myPortNumber + "##" + "null";
-					Log.d(TAG, "Sending JOIN request to 5554 ==> " + messageToBeSent1);
-
-					sendOnSocket(messageToBeSent1, destinationPortId1);
-					break;
-
-				case SEND_JOIN_RESPONSE: /* 2 */
-					/* Tell everyone about their neighbours */
-					for (String hashedPortId : nodeInformation.keySet()) {
-
-						/* Which port are we sending the message on */
-						int portId2 = nodeInformation.get(hashedPortId);
-						int destinationPortId2 = portId2 * 2;
-
-						/* Make the message to be sent */
-						String messageToBeSent2 = Mode.JOIN_RESPONSE.toString() + "##" + myPortNumber + "##" + getPredecessorAndSuccessor(hashedPortId);
-
-						Log.d(TAG, "Sending neighbour information to " + portId2 + " ==> " + messageToBeSent2);
-
-						/* Send the message */
-						sendOnSocket(messageToBeSent2, destinationPortId2);
-					}
-
-					break;
+				//case SEND_JOIN_REQUEST: /* 1 */
+				//	/* Send join request to 5554 */
+				//	int destinationPortId1 = 5554 * 2;
+				//	String messageToBeSent1 = Mode.JOIN_REQUEST.toString() + "##" + myPortNumber + "##" + "null";
+				//	Log.d(TAG, "Sending JOIN request to 5554 ==> " + messageToBeSent1);
+				//
+				//	sendOnSocket(messageToBeSent1, destinationPortId1);
+				//	break;
+				//
+				//case SEND_JOIN_RESPONSE: /* 2 */
+				//	/* Tell everyone about their neighbours */
+				//	for (String hashedPortId : nodeInformation.keySet()) {
+				//
+				//		/* Which port are we sending the message on */
+				//		int portId2 = nodeInformation.get(hashedPortId);
+				//		int destinationPortId2 = portId2 * 2;
+				//
+				//		/* Make the message to be sent */
+				//		String messageToBeSent2 = Mode.JOIN_RESPONSE.toString() + "##" + myPortNumber + "##" + getPredecessorAndSuccessor(hashedPortId);
+				//
+				//		Log.d(TAG, "Sending neighbour information to " + portId2 + " ==> " + messageToBeSent2);
+				//
+				//		/* Send the message */
+				//		sendOnSocket(messageToBeSent2, destinationPortId2);
+				//	}
+				//
+				//	break;
 
 				case INSERT_REQUEST: /* 3 */
 					/* Construct message as ===> <mode> ## <key> ## <value> */
