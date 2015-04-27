@@ -178,7 +178,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			}
 
 			/* Wait until the query is answered by ALL */
-			Log.v(TAG, "Waiting for EVERYONE to reply to the '*' query");
+			Log.v(TAG, "Waiting for EVERYONE to reply to the '*' query.");
 			boolean allDone;
 			do {
 				allDone = true;
@@ -186,7 +186,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 					allDone = allDone && isQueryAnswered.get("*" + "###" + String.valueOf(portNum));
 				/* TODO: Failure scenario: Handle the case when one of the AVDs fails. This could go into an infinite loop */
 			} while (!allDone);
-			Log.v(TAG, "EVERYONE has replied to the '*' query");
+			Log.v(TAG, "Got responses from EVERYONE for the '*' query");
 
 			/* The "*" query has been answered by all. Store the results in the cursor and return them. */
 			/* Split up the key-value pairs in "resultOfMyQuery" */
