@@ -22,15 +22,17 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.Formatter;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
 
 
 public class SimpleDynamoProvider extends ContentProvider {
+
+	static int TIMEOUT = 1000;
+
 	/* My port number (this device's port number) */
 	static int myPortNumber = 0;
 	static String TAG = null;
@@ -41,19 +43,20 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	Context context;
 	static final int SERVER_PORT = 10000;
-	static final int[] PORT_ID_LIST = {5562, 5556, 5554, 5558, 5560};
+	static List<Integer> PORT_ID_LIST = new ArrayList<>();
 
 	static final String URI_SCHEME = "content";
 	static final String URI_AUTHORITY = "edu.buffalo.cse.cse486586.simpledynamo.provider";
 
-	/* Important stuff */
-	TreeMap<String, Integer> nodeInformation = new TreeMap<>();
+	/* Stuff from the last PA */
+	//TreeMap<String, Integer> nodeInformation = new TreeMap<>();
 	//static int predecessorId = 0, successorId = 0;
-	static boolean is5554Alive = false;
+	//static boolean is5554Alive = false;
 
 	/* Key = <query_key###portNumOfTarget> */
 	static Map<String, Boolean> isQueryAnswered = new HashMap<>();
 	static Map<String, String> resultOfMyQuery = new HashMap<>();
+	static Map<String, Boolean> acksReceivedForInsert = new HashMap<>();
 
 	/* Map<KEY, List<PORT-ID> */
 	static Map<String, List<String>> keysInserted = new HashMap<>();
@@ -80,6 +83,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 		context = getContext();
 
+		PORT_ID_LIST.add(5562); PORT_ID_LIST.add(5556); PORT_ID_LIST.add(5554); PORT_ID_LIST.add(5558); PORT_ID_LIST.add(5560);
+
 		/* Get own port ID */
 		TelephonyManager tel = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
 		String portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
@@ -97,10 +102,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 		//if (myPortNumber == 5554) {
 			/* Put self in the nodeInformation map */
-			//nodeInformation.put(genHash(String.valueOf(myPortNumber)), myPortNumber);
+		//nodeInformation.put(genHash(String.valueOf(myPortNumber)), myPortNumber);
 		//} else {
 			/* Send a join request to 5554 (11108) */
-			//new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.SEND_JOIN_REQUEST));
+		//new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.SEND_JOIN_REQUEST));
 		//}
 
 		/* Create a server socket and a thread (AsyncTask) that listens on the server port */
@@ -124,7 +129,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		    /* If “*” is given as the selection parameter to delete(),
 		       then you need to delete all <key, value> pairs stored in your entire DHT. */
 
-			for (int portNum: PORT_ID_LIST)
+			for (int portNum : PORT_ID_LIST)
 				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DELETE_STAR_REQUEST), String.valueOf(portNum));
 
 			/* TODO: Need to do anything else? Need ACKs? */
@@ -141,20 +146,49 @@ public class SimpleDynamoProvider extends ContentProvider {
 			String msgKey = selection;
 
 			int coordinatorPortId = whereDoesItBelong(msgKey);
-			int replicaIDs[] = getThreeReplicaIDs(coordinatorPortId, PORT_ID_LIST);
+			List<Integer> replicaIDs = getThreeReplicaIDs(coordinatorPortId, PORT_ID_LIST);
 
-			for (int replicaID: replicaIDs) {
+			for (int replicaID : replicaIDs) {
 				Log.d(TAG, "[Insert] " + msgKey + " ==> Sending DELETE request to => " + replicaID);
-				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DELETE_SINGLE_KEY_REQUEST), msgKey, replicaID);
+				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DELETE_SINGLE_KEY_REQUEST), msgKey, String.valueOf(replicaID));
 
 				/* TODO: Need to do anything else? Need ACKs? */
 				/* The ACK boolean variable must be specific to msg-key & AVD number
 				 * and must be reset to false after this statement */
 
- 			}
+			}
 		}
 
 		return 0;
+	}
+
+	private void waiter(String msgKey, Map<String, Long> timestamps, List<Integer> listOfPorts, Map<String, Boolean> ackChecker, String mode) {
+		Log.v(TAG, "[" + mode + " for " + msgKey + "] " + "Waiting for everyone to reply...");
+		boolean allDone, isTimedOut;
+		do {
+			int ackCount = 0;
+			allDone = false;
+			isTimedOut = false;
+
+			for (int portNum : listOfPorts) {
+				/* Count how many ACKs have been received */
+				ackCount += ((ackChecker.get(msgKey + "###" + String.valueOf(portNum))) ? 1 : 0);
+
+				/* Check if this AVD has timed out */
+				long timeNow = new Date().getTime();
+				if (timeNow - timestamps.get(msgKey + "###" + String.valueOf(portNum)) >= TIMEOUT) {
+					isTimedOut = true;
+					Log.d(TAG, "[" + mode + " for " + msgKey + "] " + "TIMEOUT on node: " + portNum);
+				}
+			}
+
+			if (ackCount == listOfPorts.size())
+				allDone = true;
+
+			if (ackCount < listOfPorts.size()-1 && isTimedOut)
+				Log.e(TAG, "[" + mode + " for " + msgKey + "] " + " WHY IS THERE A TIMEOUT HERE ackCount = " + ackCount + "/" + listOfPorts.size());
+
+		} while (!allDone && !isTimedOut);
 	}
 
 	@Override
@@ -164,87 +198,122 @@ public class SimpleDynamoProvider extends ContentProvider {
 		/* Make the cursor */
 		String[] columnNames = {"key", "value"};
 		MatrixCursor matrixCursor = new MatrixCursor(columnNames);
-		//Log.d(TAG, "[Query] " + "Query received. Selection ==> " + selection);
 
 		if (selection.equals("\"*\"")) {
 
-			/* Ask everyone for their stuff */
-			for (int portNum: PORT_ID_LIST) {
+			//synchronized (this) {
+				Map<String, Long> timestamps = new HashMap<>();
 
-				/* Key = <message_key###portNumOfTarget> */
-				isQueryAnswered.put("*" + "###" + String.valueOf(portNum), false);
+				/* Ask everyone for their stuff */
+				for (int portNum : PORT_ID_LIST) {
+					/* Key = <message_key###portNumOfTarget> */
+					isQueryAnswered.put("*" + "###" + String.valueOf(portNum), false);
 
-				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.QUERY_STAR_REQUEST), String.valueOf(portNum));
+					new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.QUERY_STAR_REQUEST), String.valueOf(portNum));
+					timestamps.put("*" + "###" + String.valueOf(portNum), new Date().getTime());
+				}
+
+				/* -------- Wait until the query is answered by ALL */
+				waiter("*", timestamps, PORT_ID_LIST, isQueryAnswered, "Query");
+				Log.v(TAG, "Got responses from everyone (or almost everyone) for the '*' query");
+
+				/* The "*" query has been answered by all. Store the results in the cursor and return them. */
+				/* Split up the key-value pairs in "resultOfMyQuery" */
+				Map<String, String> resultsMap = new HashMap<>();
+				for (int portNum : PORT_ID_LIST) {
+
+					if (resultOfMyQuery.containsKey("*" + "###" + String.valueOf(portNum))) {
+						String result = resultOfMyQuery.get("*" + "###" + String.valueOf(portNum));
+						if (result.contains(",")) {
+							String[] starResults = result.trim().split(",");
+							for (String starResult : starResults) {
+								/* starResult is made of key===value */
+								String[] keyValue = starResult.split("===");
+								String key = keyValue[0];
+								String value = keyValue[1];
+
+								/* If another AVD had already sent a value for this key,
+								 * make sure we have the most recent version */
+								if (resultsMap.containsKey(key)) {
+									int existingVersion = getVersion(resultsMap.get(key));
+									int thisVersion = getVersion(value);
+
+									/* If this version is older than the existing one, keep the existing one */
+									if (thisVersion < existingVersion)
+										value = resultsMap.get(key);
+								}
+
+								resultsMap.put(key, value);
+							}
+						}
+					}
+				}
+
+				/* Add rows to the matrix cursor with the key & value */
+				for (String key: resultsMap.keySet()) {
+					/* Ignore the version, and put the actual value */
+					String actualValue = getActualValue(resultsMap.get(key));
+					String[] columnValues = {key, actualValue};
+					matrixCursor.addRow(columnValues);
+				}
+
+				Log.v(TAG, "Query for '*' complete. No. of rows retrieved ==> " + matrixCursor.getCount());
+			//}
+
+		} else if (selection.equals("\"@\"")) {
+
+			/* Return all key-value pairs on this local partition */
+			for (String key : keysInsertedLocally)
+				addRowToCursor(key, matrixCursor);
+			Log.v(TAG, "Query for '@' complete. No. of rows retrieved ==> " + matrixCursor.getCount());
+
+		} else {
+			/* ------------------------------ Normal key ("selection" is the key) */
+			/* TODO: Put a SYNCHRONIZED block here if necessary */
+			String msgKey = selection;
+
+			/* Find out where it belongs */
+			int coordinatorPortId = whereDoesItBelong(msgKey);
+			List<Integer> replicaIDs = getThreeReplicaIDs(coordinatorPortId, PORT_ID_LIST);
+
+			/*  Keep track of time stamps */
+			Map<String, Long> timestamps = new HashMap<>();
+
+			Log.d(TAG, "[Query for " + msgKey + "] " + " ==> Sending query requests to => " + replicaIDs);
+			for (int replicaID : replicaIDs) {
+				isQueryAnswered.put(msgKey + "###" + String.valueOf(replicaID), false);
+
+				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.QUERY_FIND_REQUEST), msgKey, String.valueOf(replicaID));
+				timestamps.put(msgKey + "###" + String.valueOf(replicaID), new Date().getTime());
 			}
 
-			/* Wait until the query is answered by ALL */
-			Log.v(TAG, "Waiting for EVERYONE to reply to the '*' query.");
-			boolean allDone;
-			do {
-				allDone = true;
-				for (int portNum: PORT_ID_LIST)
-					allDone = allDone && isQueryAnswered.get("*" + "###" + String.valueOf(portNum));
-				/* TODO: Failure scenario: Handle the case when one of the AVDs fails. This could go into an infinite loop */
-			} while (!allDone);
-			Log.v(TAG, "Got responses from EVERYONE for the '*' query");
+			/* -------- Wait for ACKs or until timeout */
+			waiter(msgKey, timestamps, replicaIDs, isQueryAnswered, "Query");
+			Log.v(TAG, "[Query for " + msgKey + "] " + "Got responses from everyone (or almost everyone)");
 
-			/* The "*" query has been answered by all. Store the results in the cursor and return them. */
-			/* Split up the key-value pairs in "resultOfMyQuery" */
-			for (int portNum: PORT_ID_LIST) {
-				String result = resultOfMyQuery.get("*" + "###" + String.valueOf(portNum));
-				if (result.contains(",")) {
-					String[] starResults = result.trim().split(",");
-					for (String starResult : starResults) {
-						/* starResult is made of key===value */
-						String[] keyValue = starResult.split("===");
+			/* Query has been answered. */
+			List<String> resultList = new ArrayList<>();
+			for (int replicaID : replicaIDs)
+				if (resultOfMyQuery.containsKey(msgKey + "###" + String.valueOf(replicaID)))
+					resultList.add(resultOfMyQuery.get(msgKey + "###" + coordinatorPortId));
 
-						/* Add row to the cursor with the key & value */
-						String[] columnValues = {keyValue[0], keyValue[1]};
-						matrixCursor.addRow(columnValues);
-					}
+			/* Find the most recent result (the latest version) */
+			String mostRecentResult = "";
+			int latestVersion = 0;
+			for (String result: resultList) {
+				/* TODO: VERSIONING ==> Get latest version from all the replies */
+				int thisVersion = getVersion(result);
+				if (thisVersion > latestVersion) {
+					latestVersion = thisVersion;
+					mostRecentResult = result;
 				}
 			}
 
-			Log.v(TAG, "Query for '*' complete. No. of rows retrieved ==> " + matrixCursor.getCount());
-
-		} else if (selection.equals("\"@\"")) {
-		    /* Handle case for "@" */
-
-			/* Return all key-value pairs on this local partition */
-			for (String key : keysInsertedLocally) {
-				addRowToCursor(key, matrixCursor);
-			}
-
-			/* TODO: Seems like this is all that needs to be done. Check if it needs anything else. */
-			Log.v(TAG, "Query for '@' complete. No. of rows retrieved ==> " + matrixCursor.getCount());
-			Log.v(TAG, "No. of local insertions ==> " + numOfKeysInserted);
-
-		} else {
-			/* ---- Normal key ("selection" is the key) */
-			String msgKey = selection;
-
-			/* Find where it belongs */
-			int coordinatorPortId = whereDoesItBelong(msgKey);
-
-			isQueryAnswered.put(msgKey + "###" + coordinatorPortId, false);
-
-			/* The value belongs somewhere else. Ask the successor if it has it */
-			Log.d(TAG, "[Query for " + msgKey + "] ==> This key belongs at => " + coordinatorPortId);
-			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.QUERY_FIND_REQUEST), msgKey, String.valueOf(coordinatorPortId));
-
-			/* Wait until the query is answered */
-			while (!isQueryAnswered.get(msgKey + "###" + coordinatorPortId));
-
-			/* Query has been answered. Store the results in cursor and return them. */
-			String[] columnValues = {selection, resultOfMyQuery.get(msgKey + "###" + coordinatorPortId)};
+			/* Store the result in the matrix-cursor and return them. */
+			String[] columnValues = {msgKey, getActualValue(mostRecentResult)};
 			matrixCursor.addRow(columnValues);
 
-			/* ================================= TODO: Use this code */
-			///* The key-value pair is here. Read it into the cursor */
-			//Log.d(TAG, "[Query] " + selection + " ==> belongs here. Reading.");
-			//addRowToCursor(selection, matrixCursor);
-
-			Log.v(TAG, "[Query for " + msgKey + "] No. of rows retrieved ==> " + matrixCursor.getCount());
+			Log.v(TAG, "[Query for " + msgKey + "] Complete. No. of rows retrieved ==> " + matrixCursor.getCount());
 		}
 
 		return matrixCursor;
@@ -253,42 +322,37 @@ public class SimpleDynamoProvider extends ContentProvider {
 	@Override
 	public Uri insert(Uri uri, ContentValues values) {
 
-		String msgKey = (String) values.get("key");
-		String msgValue = (String) values.get("value");
+		//synchronized (this) {
+			String msgKey = (String) values.get("key");
+			String msgValue = (String) values.get("value");
 
-		/* Does it belong here? */
-		//boolean belongsHere = doesItBelongHere(hashedKey, myPortNumber);
-		int coordinatorPortId = whereDoesItBelong(msgKey);
-		int replicaIDs[] = getThreeReplicaIDs(coordinatorPortId, PORT_ID_LIST);
+			/* Find out where it belongs */
+			int coordinatorPortId = whereDoesItBelong(msgKey);
+			List<Integer> replicaIDs = getThreeReplicaIDs(coordinatorPortId, PORT_ID_LIST);
 
-		Log.d(TAG, "[Insert] " + msgKey + " ==> Sending insert request to => " + replicaIDs[0] + ", " + replicaIDs[1] + ", " + replicaIDs[2]);
-		for (int replicaID: replicaIDs) {
-			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.INSERT_REQUEST), msgKey, msgValue, String.valueOf(replicaID));
+			/* Keep track of time stamps */
+			Map<String, Long> timestamps = new HashMap<>();
 
-			/* TODO: Wait for ACKs or until timeout */
-			/* The ACK boolean variable must be specific to msg-key & AVD number
-			 * and must be reset to false after this statement */
+			Log.d(TAG, "[Insert] " + msgKey + " ==> Sending insert requests to => " + replicaIDs);
+			for (int replicaID : replicaIDs) {
+				/* Key = <message_key###portNumOfTarget> */
+				acksReceivedForInsert.put(msgKey + "###" + String.valueOf(replicaID), false);
 
+				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.INSERT_REQUEST), msgKey, msgValue, String.valueOf(replicaID));
+				timestamps.put(msgKey + "###" + String.valueOf(replicaID), new Date().getTime());
+			}
 
- 		}
+			/* -------- Wait for ACKs or until timeout */
+			waiter(msgKey, timestamps, replicaIDs, acksReceivedForInsert, "Insert");
+			Log.v(TAG, "[Insert for " + msgKey + "] " + "Got responses from everyone (or almost everyone)");
 
-		//if (belongsHere) {
-		//	/* Since it belongs here, write the content values to internal storage */
-		//	Log.d(TAG, "[Insert] " + msgKey + " belongs here. Inserting.");
-		//	writeToInternalStorage(msgKey, msgValue);
-		//	keysInsertedLocally.add(msgKey);
-		//} else {
-		//	/* Doesn't belong here. Pass it on until it reaches the right place. */
-		//	Log.d(TAG, "[Insert] " + msgKey + " ==> does not belong here. Passing to successor => " + successorId);
-		//	new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.INSERT_REQUEST), msgKey, msgValue);
+			return null;
 		//}
-
-		return null;
 	}
 
 	private int whereDoesItBelong(String msgKey) {
 		String hashedKey = genHash(msgKey);
-		for (int portId: PORT_ID_LIST)
+		for (int portId : PORT_ID_LIST)
 			if (doesItBelongHere(hashedKey, portId))
 				return portId;
 		return -1;
@@ -307,11 +371,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 		/* Find predecessor & sucessor IDs */
 		int nodeIndex = -1;
-		for (int i=0; i< PORT_ID_LIST.length; i++)
-			if (PORT_ID_LIST[i] == nodeId)
+		for (int i = 0; i < PORT_ID_LIST.size(); i++)
+			if (PORT_ID_LIST.get(i) == nodeId)
 				nodeIndex = i;
-		int predecessorId = PORT_ID_LIST[(nodeIndex > 0) ? (nodeIndex-1) : PORT_ID_LIST.length-1];
-		int successorId = PORT_ID_LIST[(nodeIndex+1) % (PORT_ID_LIST.length)];
+		int predecessorId = PORT_ID_LIST.get((nodeIndex > 0) ? (nodeIndex - 1) : PORT_ID_LIST.size() - 1);
+		int successorId = PORT_ID_LIST.get((nodeIndex + 1) % (PORT_ID_LIST.size()));
 		String predecessorHashedId = genHash(String.valueOf(predecessorId));
 		String successorHashedId = genHash(String.valueOf(successorId));
 
@@ -377,7 +441,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 	}
 
 	private String readFromInternalStorage(String fileName) {
-		String contentOfFile = "";
+		String contentOfFile = null;
 		try {
 			File file = context.getFileStreamPath(fileName);
 			if (file.exists()) {
@@ -425,28 +489,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 					Mode mode = Mode.valueOf(incoming[0]);
 
 					switch (mode) {
-						//case JOIN_REQUEST: /* 1 */
-						//	/* --- Got a join request */
-						//
-						//	/* Update the nodeInformation list */
-						//	String sendersActualID1 = incoming[1];
-						//	nodeInformation.put(genHash(sendersActualID1), Integer.parseInt(sendersActualID1));
-						//
-						//	/* Respond to EVERYONE, informing them of their predecessor and successor. */
-						//	new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.SEND_JOIN_RESPONSE));
-						//	break;
-						//
-						//case JOIN_RESPONSE: /* 2 */
-						//	/* --- Got a response from 5554 for the join request I (OR SOMEONE ELSE) had sent */
-						//	is5554Alive = true;
-						//	Log.d(TAG, "Got neighbour information from 5554 ==> " + incomingString);
-						//
-						//	String IDs2 = incoming[2];
-						//	String[] parts2 = IDs2.split("%%");
-						//	predecessorId = Integer.parseInt(parts2[0]);
-						//	successorId = Integer.parseInt(parts2[1]);
-						//
-						//	break;
 
 						case INSERT_REQUEST: /* 3 */
 							/* A request for insertion received.
@@ -454,15 +496,25 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 							String msgKey3 = incoming[1];
 							String msgValue3 = incoming[2];
-							String originatorsPort3 = incoming[3];
+							int originatorsPortId3 = Integer.parseInt(incoming[3]);
 
 							/* Since it belongs here, write the content values to internal storage */
 							Log.d(TAG, "[Insert] " + msgKey3 + " belongs here. WRITING.");
-							writeToInternalStorage(msgKey3, msgValue3);
+
+							/* Get the current version */
+							int version = 1;
+							String currentData = readFromInternalStorage(msgKey3);
+							if (currentData != null)
+								version = 1 + getVersion(currentData);
+
+							/* Write to storage */
+							writeToInternalStorage(msgKey3, version + "@@@" + msgValue3);
 							keysInsertedLocally.add(msgKey3);
 							numOfKeysInserted++;
 
-							/* TODO: Send ACK to originator */
+							/* Send ACK to originator */
+							String messageToBeSent3 = Mode.ACK_FOR_INSERT.toString() + "##" + msgKey3 + "##" + String.valueOf(myPortNumber);
+							sendOnSocket(messageToBeSent3, originatorsPortId3 * 2);
 
 							break;
 
@@ -500,8 +552,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 							}
 
 							/* Remove trailing comma */
-							if (!aggregatedResult6.isEmpty() && aggregatedResult6.charAt(aggregatedResult6.length()-1) == ',')
-								aggregatedResult6 = aggregatedResult6.substring(0, aggregatedResult6.length()-1);
+							if (!aggregatedResult6.isEmpty() && aggregatedResult6.charAt(aggregatedResult6.length() - 1) == ',')
+								aggregatedResult6 = aggregatedResult6.substring(0, aggregatedResult6.length() - 1);
 
 							Log.d(TAG, "Appended my stuff to the '*' query ==> " + aggregatedResult6);
 
@@ -513,12 +565,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 						case DELETE_SINGLE_KEY_REQUEST: /* 7 */
 							/* The key is on THIS partition. Delete it */
-							String msgKey9 = incoming[1];
-							String originatorsPort9 = incoming[2];
+							String msgKey7 = incoming[1];
+							String originatorsPort7 = incoming[2];
 
 							/* TODO: Check if this works */
-							context.deleteFile(msgKey9);
-							keysInsertedLocally.remove(msgKey9);
+							context.deleteFile(msgKey7);
+							keysInsertedLocally.remove(msgKey7);
 
 							/* TODO: Send an ACK? Not needed most probably */
 							break;
@@ -526,7 +578,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 						case DELETE_STAR_REQUEST: /* 8 */
 							/* Delete everything locally */
 
-							String originatorsPort10 = incoming[1];
+							String originatorsPort8 = incoming[1];
 
 							for (String key : keysInsertedLocally)
 								context.deleteFile(key);
@@ -536,10 +588,22 @@ public class SimpleDynamoProvider extends ContentProvider {
 							break;
 
 						case ACK_FOR_INSERT: /* 9 */
-							/* TODO: ACK received (I'm the originator). Set flag = true */
+							/* ACK received (I'm the originator). Set flag = true */
+							String msgKey9 = incoming[1];
+							String idOfAckSender9 = incoming[2];
 
-						case ACK_FOR_QUERY: /* 10 */
-							/* TODO: ACK received (I'm the originator). Set flag = true */
+							/* Put the ACK in some static data structure */
+							acksReceivedForInsert.put(msgKey9 + "###" + idOfAckSender9, true);
+							break;
+
+						//case ACK_FOR_QUERY: /* 10 */
+						//	/* ACK received (I'm the originator). Set flag = true */
+						//	String msgKey10 = incoming[1];
+						//	String idOfAckSender10 = incoming[2];
+						//
+						//	/* Put the ACK in some static data structure */
+						//	acksReceivedForQuery.put(msgKey10 + "###" + idOfAckSender10, true);
+						//  break;
 					}
 				}
 			} catch (IOException e) {
@@ -645,7 +709,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 					sendOnSocket(messageToBeSent8, Integer.parseInt(destinationPort8) * 2);
 					break;
 
-
 			}
 
 			return null;
@@ -656,48 +719,59 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	/* ---------- UTIL methods and enums */
 
-	private static int[] getThreeReplicaIDs(int coordinatorId, int[] idList) {
-		int[] list = new int[3];
+	private int getVersion(String content) {
+		return Integer.parseInt(content.substring(0, content.indexOf("@@@")));
+	}
+
+	private String getActualValue(String content) {
+		return content.substring(content.indexOf("@@@") + "@@@".length());
+	}
+
+	private static List<Integer> getThreeReplicaIDs(int coordinatorId, List<Integer> idList) {
+		List<Integer> list = new ArrayList<>();
 		int coordinatorIndex = -1;
-		for (int i=0; i< idList.length; i++)
-			if (idList[i] == coordinatorId)
+		for (int i = 0; i < idList.size(); i++)
+			if (idList.get(i) == coordinatorId)
 				coordinatorIndex = i;
-		list[0] = idList[coordinatorIndex];
-		list[1] = idList[(coordinatorIndex+1) % (idList.length)];
-		list[2] = idList[(coordinatorIndex+2) % (idList.length)];
+		list.add(idList.get(coordinatorIndex));
+		list.add(idList.get((coordinatorIndex + 1) % (idList.size())));
+		list.add(idList.get((coordinatorIndex + 2) % (idList.size())));
 		return list;
 	}
 
-	private String getPredecessorAndSuccessor(String hashedPortId) {
-		/* Return ==> predecessorID %% successorID */
-		String predecessorAndSuccessorHashedIDs;
-		String predecessorID = null, successorId;
-		Iterator<String> iterator = nodeInformation.keySet().iterator();
-		while (iterator.hasNext()) {
-			String currentKey = iterator.next();
-			if (currentKey.equals(hashedPortId))
-				break;
-			predecessorID = String.valueOf(nodeInformation.get(currentKey));
-		}
-
-		/* Get predecessor */
-		if (predecessorID == null)
-			predecessorID = String.valueOf(nodeInformation.get(nodeInformation.lastKey()));
-
-		/* Get successor */
-		if (iterator.hasNext())
-			successorId = String.valueOf(nodeInformation.get(iterator.next()));
-		else
-			successorId = String.valueOf(nodeInformation.get(nodeInformation.firstKey()));
-
-		/* Construct the return string */
-		predecessorAndSuccessorHashedIDs = predecessorID + "%%" + successorId;
-
-		return predecessorAndSuccessorHashedIDs;
-	}
+	//private String getPredecessorAndSuccessor(String hashedPortId) {
+	//	/* Return ==> predecessorID %% successorID */
+	//	String predecessorAndSuccessorHashedIDs;
+	//	String predecessorID = null, successorId;
+	//	Iterator<String> iterator = nodeInformation.keySet().iterator();
+	//	while (iterator.hasNext()) {
+	//		String currentKey = iterator.next();
+	//		if (currentKey.equals(hashedPortId))
+	//			break;
+	//		predecessorID = String.valueOf(nodeInformation.get(currentKey));
+	//	}
+	//
+	//	/* Get predecessor */
+	//	if (predecessorID == null)
+	//		predecessorID = String.valueOf(nodeInformation.get(nodeInformation.lastKey()));
+	//
+	//	/* Get successor */
+	//	if (iterator.hasNext())
+	//		successorId = String.valueOf(nodeInformation.get(iterator.next()));
+	//	else
+	//		successorId = String.valueOf(nodeInformation.get(nodeInformation.firstKey()));
+	//
+	//	/* Construct the return string */
+	//	predecessorAndSuccessorHashedIDs = predecessorID + "%%" + successorId;
+	//
+	//	return predecessorAndSuccessorHashedIDs;
+	//}
 
 	private void addRowToCursor(String key, MatrixCursor matrixCursor) {
-		String fileContent = readFromInternalStorage(key);
+		String contentRead = readFromInternalStorage(key);
+		/* Ignore the version part, and just return the actual value */
+		String fileContent = getActualValue(contentRead);
+
 		if (fileContent != null && fileContent.length() > 0) {
 			String[] columnValues = new String[2];
 			columnValues[0] = key;
