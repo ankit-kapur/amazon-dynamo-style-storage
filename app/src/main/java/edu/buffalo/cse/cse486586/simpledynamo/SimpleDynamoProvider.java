@@ -31,7 +31,7 @@ import java.util.Map;
 
 public class SimpleDynamoProvider extends ContentProvider {
 
-	final int TIMEOUT = 1000;
+	final int TIMEOUT = 3000;
 
 	/* Key = <query_key###portNumOfTarget> */
 	static Map<String, Boolean> isQueryAnswered = new HashMap<>();
@@ -44,8 +44,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 	static int myPortNumber = 0;
 	static String TAG = null;
 	final String DUMMY_FILE_NAME = "DUMMY";
-	final String URI_SCHEME = "content";
-	final String URI_AUTHORITY = "edu.buffalo.cse.cse486586.simpledynamo.provider";
+	static final String URI_SCHEME = "content";
+	static final String URI_AUTHORITY = "edu.buffalo.cse.cse486586.simpledynamo.provider";
 	static List<Integer> PORT_ID_LIST = new ArrayList<>();
 	static Map<Integer, String> HASHED_PORT_ID_LIST = new HashMap<>();
 
@@ -148,14 +148,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 	}
 
 	@Override
-	public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs,
+	public Cursor query(Uri uri, String[] projection, String msgKey, String[] selectionArgs,
 	                    String sortOrder) {
 
 		/* Make the cursor */
 		String[] columnNames = {"key", "value"};
 		MatrixCursor matrixCursor = new MatrixCursor(columnNames);
 
-		if (selection.equals("\"*\"")) {
+		if (msgKey.equals("\"*\"")) {
 
 			//synchronized (this) {
 				Map<String, Long> timestamps = new HashMap<>();
@@ -188,7 +188,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 				Log.v(TAG, "Query for '*' complete. No. of rows retrieved ==> " + matrixCursor.getCount());
 			//}
 
-		} else if (selection.equals("\"@\"")) {
+		} else if (msgKey.equals("\"@\"")) {
 
 			/* Return all key-value pairs on this local partition */
 			for (String key : context.fileList())
@@ -197,9 +197,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			Log.v(TAG, "Query for '@' complete. No. of rows retrieved ==> " + matrixCursor.getCount());
 
 		} else {
-			/* ------------------------------ Normal key ("selection" is the key) */
-			/* TODO: Put a SYNCHRONIZED block here if necessary */
-			String msgKey = selection;
+			/* ---------------------------- Normal query (Single key) */
 
 			/* Find out where it belongs */
 			int coordinatorPortId = whereDoesItBelong(msgKey);
@@ -208,7 +206,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			/*  Keep track of time stamps */
 			Map<String, Long> timestamps = new HashMap<>();
 
-			Log.d(TAG, "[Query for " + msgKey + "] " + " ==> Sending query requests to => " + replicaIDs);
+			Log.d(TAG, "[Query for " + msgKey + "] " + "Sending query requests to => " + replicaIDs);
 			for (int replicaID : replicaIDs) {
 				isQueryAnswered.put(msgKey + "###" + String.valueOf(replicaID), false);
 
@@ -224,7 +222,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 			List<String> resultList = new ArrayList<>();
 			for (int replicaID : replicaIDs)
 				if (resultOfMyQuery.containsKey(msgKey + "###" + String.valueOf(replicaID)))
-					resultList.add(resultOfMyQuery.get(msgKey + "###" + coordinatorPortId));
+					resultList.add(resultOfMyQuery.get(msgKey + "###" + String.valueOf(replicaID)));
+
+			Log.v(TAG, "[Query for " + msgKey + "] Results received ==> " + resultList);
 
 			/* Find the most recent result (the latest version) */
 			String mostRecentResult = "";
@@ -262,7 +262,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			/* Keep track of time stamps */
 			Map<String, Long> timestamps = new HashMap<>();
 
-			Log.d(TAG, "[Insert] " + msgKey + " ==> Sending insert requests to => " + replicaIDs);
+			Log.d(TAG, "[Insert for " + msgKey + "] Sending insert requests to => " + replicaIDs);
 			for (int replicaID : replicaIDs) {
 				/* Key = <message_key###portNumOfTarget> */
 				acksReceivedForInsert.put(msgKey + "###" + String.valueOf(replicaID), false);
@@ -306,7 +306,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 					BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
 					String incomingString = bufferedReader.readLine();
 
-					Log.d(TAG, "Incoming ==> " + incomingString);
+					//Log.d(TAG, "Incoming ==> " + incomingString);
 					String incoming[] = incomingString.split("##");
 					Mode mode = Mode.valueOf(incoming[0]);
 
@@ -314,44 +314,20 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 						case INSERT_REQUEST: /* 3 */
 							/* A request for insertion received.
-							   Message structure ===> <mode> ## <key> ## <value> ## <originator's port> */
+							 * Message structure ===> <mode> ## <key> ## <value> ## <originator's port> */
 
 							String msgKey3 = incoming[1];
 							String msgValue3 = incoming[2];
-							int originatorsPortId3 = Integer.parseInt(incoming[3]);
+							String originatorsPortId3 = incoming[3];
 
-							/* Since it belongs here, write the content values to internal storage */
-							Log.d(TAG, "[Insert] " + msgKey3 + " belongs here. WRITING.");
-
-							/* Get the current version */
-							int version = 1;
-							String currentData = readFromInternalStorage(msgKey3);
-							if (currentData != null)
-								version = 1 + getVersion(currentData);
-
-							/* Write to storage */
-							writeToInternalStorage(msgKey3, version + "@@@" + msgValue3);
-							//keysInsertedLocally.add(msgKey3);
-							//numOfKeysInserted++;
-
-							/* Send ACK to originator */
-							String messageToBeSent3 = Mode.ACK_FOR_INSERT.toString() + "##" + msgKey3 + "##" + String.valueOf(myPortNumber);
-							sendOnSocket(messageToBeSent3, originatorsPortId3 * 2);
-
+							new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DO_INSERTION), msgKey3, msgValue3, originatorsPortId3);
 							break;
 
 						case QUERY_FIND_REQUEST: /* 4 */
-							// String messageToBeSent4 = Mode.QUERY_FIND_REQUEST.toString() + "##" + originator4 + "##" + keyToFind4;
 							String originatorPortId4 = incoming[1];
 							String keyToFind4 = incoming[2];
 
-							/* The key is present here. Get it's value and inform the originator */
-							String queryResult4 = readFromInternalStorage(keyToFind4);
-							Log.d(TAG, "[Query] " + keyToFind4 + " ==> belongs here. Sending back value to originator => " + originatorPortId4);
-
-							String messageToBeSent4 = Mode.QUERY_RESULT_FOUND.toString() + "##" + keyToFind4 + "##" + queryResult4 + "##" + String.valueOf(myPortNumber);
-							sendOnSocket(messageToBeSent4, Integer.parseInt(originatorPortId4) * 2);
-
+							new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.QUERY_RESULT_FOUND), originatorPortId4, keyToFind4);
 							break;
 
 						case QUERY_RESULT_FOUND: /* 5 */
@@ -361,19 +337,13 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 							resultOfMyQuery.put(msgKey5 + "###" + sendersId5, msgValue5);
 							isQueryAnswered.put(msgKey5 + "###" + sendersId5, true);
+							Log.d(TAG, "[Query result found for " + msgKey5 + "] Value = " + msgValue5 + " [Sender: "+ sendersId5 + "]");
 							break;
 
 						case QUERY_STAR_REQUEST: /* 6 */
 							String originatorPortId6 = incoming[1];
 
-							/* Get ALL the key-value pairs stored on this device */
-							String aggregatedResult6 = getAllMyStuff();
-							Log.d(TAG, "Appended my stuff to the '*' query ==> " + aggregatedResult6);
-
-							/* Send everything back to the originator */
-							String messageToBeSent6 = Mode.QUERY_RESULT_FOUND.toString() + "##" + "*" + "##" + aggregatedResult6 + "##" + String.valueOf(myPortNumber);
-							sendOnSocket(messageToBeSent6, Integer.parseInt(originatorPortId6) * 2);
-
+							new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DO_STAR_QUERY), originatorPortId6);
 							break;
 
 						case DELETE_SINGLE_KEY_REQUEST: /* 7 */
@@ -382,8 +352,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 							String originatorsPort7 = incoming[2];
 
 							context.deleteFile(msgKey7);
-							//keysInsertedLocally.remove(msgKey7);
-
 							break;
 
 						case DELETE_STAR_REQUEST: /* 8 */
@@ -394,7 +362,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 							for (String key : context.fileList())
 								if (!key.equals(DUMMY_FILE_NAME))
 									context.deleteFile(key);
-							//keysInsertedLocally.clear();
 
 							break;
 
@@ -420,16 +387,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 							 * Store all the stuff that's been sent to me here */
  							String keyValuePairsString = incoming[1];
 							String sendersPortNum11 = incoming[2];
-							Log.d(TAG, "[Recovery] Got recovery content from " + sendersPortNum11 + " ==> " + keyValuePairsString);
 
-							Map<String, String> resultsMap = new HashMap<>();
-							putAllKeyValuePairsIntoMap(keyValuePairsString, resultsMap);
-
-							for (String key: resultsMap.keySet()) {
-								/* Ignore the version, and put the actual value */
-								String actualValue = getActualValue(resultsMap.get(key));
-								writeToInternalStorage(key, actualValue);
-							}
+							new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DO_RECOVERY), keyValuePairsString, sendersPortNum11);
 							break;
 					}
 				}
@@ -473,11 +432,16 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 				case QUERY_RESULT_FOUND: /* 5 */
 					/* The key in the query was found here. Give it's value to the originator */
-					//String originator5 = (String) params[1];
-					//String queryResult5 = (String) params[2];
-					//String messageToBeSent5 = Mode.QUERY_RESULT_FOUND.toString() + "##" + queryResult5;
-					//
-					//sendOnSocket(messageToBeSent5, Integer.parseInt(originator5) * 2);
+					String originatorPortId5 = (String) params[1];
+					String keyToFind5 = (String) params[2];
+
+					/* The key is present here. Get it's value and inform the originator */
+					String queryResult5 = readFromInternalStorage(keyToFind5);
+					Log.d(TAG, "[Query] " + keyToFind5 + " ==> belongs here. Sending back value [" + queryResult5 + "] to originator => " + originatorPortId5);
+
+					String messageToBeSent5 = Mode.QUERY_RESULT_FOUND.toString() + "##" + keyToFind5 + "##" + queryResult5 + "##" + String.valueOf(myPortNumber);
+					sendOnSocket(messageToBeSent5, Integer.parseInt(originatorPortId5) * 2);
+
 					break;
 
 				case QUERY_STAR_REQUEST: /* 6 */
@@ -529,6 +493,61 @@ public class SimpleDynamoProvider extends ContentProvider {
 					sendOnSocket(messageToBeSent10, idOfRecoveringDevice * 2);
 					break;
 
+				case DO_INSERTION: /* 11 */
+					String msgKey11 = (String) params[1];
+					String msgValue11 = (String) params[2];
+					int originatorsPortId11 = Integer.parseInt((String) params[3]);
+
+					/* Since it belongs here, write the content values to internal storage */
+					Log.d(TAG, "[Insert for " + msgKey11 + "]" + " belongs here. WRITING value [" + msgValue11 + "]");
+
+					/* Get the current version */
+					int version = 1;
+					String currentData = readFromInternalStorage(msgKey11);
+					if (!currentData.isEmpty()) {
+						int existingVersion = getVersion(currentData);
+						Log.d(TAG, "[Insert for " + msgKey11 + "]" + " Existing version ==> " + existingVersion);
+						version = 1 + getVersion(currentData);
+					} else
+						Log.d(TAG, "[Insert for " + msgKey11 + "]" + " No existing version. New data ==> " + String.valueOf(version) + "@@@" + msgValue11);
+
+					/* Write to storage */
+					writeToInternalStorage(msgKey11, String.valueOf(version) + "@@@" + msgValue11);
+					//keysInsertedLocally.add(msgKey11);
+					//numOfKeysInserted++;
+
+					/* Send ACK to originator */
+					String messageToBeSent11 = Mode.ACK_FOR_INSERT.toString() + "##" + msgKey11 + "##" + String.valueOf(myPortNumber);
+					sendOnSocket(messageToBeSent11, originatorsPortId11 * 2);
+
+					break;
+
+				case DO_RECOVERY: /* 12 */
+
+					String keyValuePairsString12 = (String) params[1];
+					String sendersPortNum12 = (String) params[2];
+					Log.d(TAG, "[Recovery] Got recovery content from " + sendersPortNum12 + " ==> " + keyValuePairsString12);
+
+					Map<String, String> resultsMap = new HashMap<>();
+					putAllKeyValuePairsIntoMap(keyValuePairsString12, resultsMap);
+
+					for (String key: resultsMap.keySet()) {
+						/* Ignore the version, and put the actual value */
+						String actualValue = resultsMap.get(key);
+						writeToInternalStorage(key, actualValue);
+					}
+					break;
+
+				case DO_STAR_QUERY: /* 13 */
+					String originatorPortId13 = (String) params[1];
+					/* Get ALL the key-value pairs stored on this device */
+					String aggregatedResult13 = getAllMyStuff();
+					Log.d(TAG, "Appended my stuff to the '*' query ==> " + aggregatedResult13);
+
+					/* Send everything back to the originator */
+					String messageToBeSent13 = Mode.QUERY_RESULT_FOUND.toString() + "##" + "*" + "##" + aggregatedResult13 + "##" + String.valueOf(myPortNumber);
+					sendOnSocket(messageToBeSent13, Integer.parseInt(originatorPortId13) * 2);
+					break;
 			}
 
 			return null;
@@ -571,7 +590,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 	}
 
 	private String readFromInternalStorage(String fileName) {
-		String contentOfFile = null;
+		String contentOfFile = "";
 		try {
 			File file = context.getFileStreamPath(fileName);
 			if (file.exists()) {
@@ -786,10 +805,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 	public enum Mode {
 		JOIN_REQUEST, JOIN_RESPONSE,
 		SEND_JOIN_RESPONSE, SEND_JOIN_REQUEST,
-		INSERT_REQUEST,
-		QUERY_FIND_REQUEST, QUERY_RESULT_FOUND, QUERY_STAR_REQUEST,
+		INSERT_REQUEST, DO_INSERTION,
+		QUERY_FIND_REQUEST, QUERY_RESULT_FOUND, QUERY_STAR_REQUEST, DO_STAR_QUERY,
 		DELETE_STAR_REQUEST, DELETE_SINGLE_KEY_REQUEST,
 		ACK_FOR_INSERT, ACK_FOR_QUERY,
-		REQUEST_RECOVERY_INFO, RECOVERY_INFORMATION;
+		REQUEST_RECOVERY_INFO, RECOVERY_INFORMATION, DO_RECOVERY
 	}
 }
