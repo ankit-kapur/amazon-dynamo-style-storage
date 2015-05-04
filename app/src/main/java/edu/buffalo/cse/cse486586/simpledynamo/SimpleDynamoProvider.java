@@ -49,6 +49,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 	static List<Integer> PORT_ID_LIST = new ArrayList<>();
 	static Map<Integer, String> HASHED_PORT_ID_LIST = new HashMap<>();
 
+	static boolean amIRecovering;
+	static int recoveryAidsReceived;
+
 	@Override
 	public boolean onCreate() {
 
@@ -75,8 +78,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 			return false;
 		}
 
+
 		/* Is this the 1st time or am I recovering? */
-		if (amIRecovering()) {
+		amIRecovering = amIRecovering();
+		recoveryAidsReceived = 0;
+
+		if (amIRecovering) {
 			/* Send recovering messages to everyone */
 			Log.d(TAG, "[Recovery] I am recovering. Asking everyone for their stuff.");
 			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.REQUEST_RECOVERY_INFO));
@@ -189,6 +196,13 @@ public class SimpleDynamoProvider extends ContentProvider {
 			//}
 
 		} else if (msgKey.equals("\"@\"")) {
+			Log.v(TAG, "Query for '@' received");
+
+			if (amIRecovering) {
+				Log.d(TAG, "[Query for @] I'm still in recovery. Waiting until recovery is complete.");
+				while(amIRecovering);
+				Log.d(TAG, "[Query for @] Recovery complete. Proceeding.");
+			}
 
 			/* Return all key-value pairs on this local partition */
 			for (String key : context.fileList())
@@ -523,10 +537,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 					break;
 
 				case DO_RECOVERY: /* 12 */
+					/* Got recovery aid from someone */
 
 					String keyValuePairsString12 = (String) params[1];
 					String sendersPortNum12 = (String) params[2];
-					Log.d(TAG, "[Recovery] Got recovery content from " + sendersPortNum12 + " ==> " + keyValuePairsString12);
+					Log.d(TAG, "[Recovery] Got recovery aid from " + sendersPortNum12 + " ==> " + keyValuePairsString12);
 
 					Map<String, String> resultsMap = new HashMap<>();
 					putAllKeyValuePairsIntoMap(keyValuePairsString12, resultsMap);
@@ -536,6 +551,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 						String actualValue = resultsMap.get(key);
 						writeToInternalStorage(key, actualValue);
 					}
+
+					if (++recoveryAidsReceived == 4) {
+						Log.d(TAG, "[Recovery] Fully recovered.");
+						amIRecovering = false;
+					}
+
 					break;
 
 				case DO_STAR_QUERY: /* 13 */
