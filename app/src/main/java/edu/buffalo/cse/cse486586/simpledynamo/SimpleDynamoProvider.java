@@ -28,7 +28,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-
 public class SimpleDynamoProvider extends ContentProvider {
 
 	final int TIMEOUT = 3000;
@@ -128,24 +127,29 @@ public class SimpleDynamoProvider extends ContentProvider {
 	private void waiter(String msgKey, Map<String, Long> timestamps, List<Integer> listOfPorts, Map<String, Boolean> ackChecker, String mode) {
 		Log.v(TAG, "[" + mode + " for " + msgKey + "] " + "Waiting for everyone to reply...");
 		boolean allDone, isTimedOut;
+		int ackCount;
 		List<Integer> devicesThatSentAcks = new ArrayList<>();
 		do {
-			int ackCount = 0;
+			ackCount = 0;
 			allDone = false;
 			isTimedOut = false;
 
 			for (int portNum : listOfPorts) {
-				/* Count how many ACKs have been received */
+
+				/* Did we get an ack from this device? */
 				boolean gotAck = ackChecker.get(msgKey + "###" + String.valueOf(portNum));
+				/* Count how many ACKs have been received */
 				ackCount += gotAck ? 1 : 0;
 				if (gotAck && !devicesThatSentAcks.contains(portNum))
 					devicesThatSentAcks.add(portNum);
 
-				/* Check if this AVD has timed out */
-				long timeNow = new Date().getTime();
-				if (timeNow - timestamps.get(msgKey + "###" + String.valueOf(portNum)) >= TIMEOUT) {
-					isTimedOut = true;
-					Log.d(TAG, "[" + mode + " for " + msgKey + "] " + "TIMEOUT on node: " + portNum);
+				/* No ack from this AVD. Check if it's timed out */
+				if (!gotAck) {
+					long timeNow = new Date().getTime();
+					if (timeNow - timestamps.get(msgKey + "###" + String.valueOf(portNum)) >= TIMEOUT) {
+						isTimedOut = true;
+						Log.d(TAG, "[" + mode + " for " + msgKey + "] " + "TIMEOUT on node: " + portNum);
+					}
 				}
 			}
 
@@ -153,9 +157,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 				allDone = true;
 
 			if (ackCount < listOfPorts.size()-1 && isTimedOut)
-				Log.e(TAG, "[" + mode + " for " + msgKey + "] " + "WHY IS THERE A TIMEOUT HERE ackCount = " + ackCount + "/" + listOfPorts.size());
+				Log.e("STRANGE " + TAG, "[" + mode + " for " + msgKey + "] " + "WHY IS THERE A TIMEOUT HERE ackCount = " + ackCount + "/" + listOfPorts.size());
 
-		} while (!allDone && !isTimedOut);
+		} while (!allDone && !(isTimedOut && ackCount == listOfPorts.size()-1));
 
 		Log.v(TAG, "[" + mode + " for " + msgKey + "] " + "Got responses from: " + devicesThatSentAcks);
 	}
