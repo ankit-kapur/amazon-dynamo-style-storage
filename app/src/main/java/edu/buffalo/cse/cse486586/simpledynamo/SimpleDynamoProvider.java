@@ -128,6 +128,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 	private void waiter(String msgKey, Map<String, Long> timestamps, List<Integer> listOfPorts, Map<String, Boolean> ackChecker, String mode) {
 		Log.v(TAG, "[" + mode + " for " + msgKey + "] " + "Waiting for everyone to reply...");
 		boolean allDone, isTimedOut;
+		List<Integer> devicesThatSentAcks = new ArrayList<>();
 		do {
 			int ackCount = 0;
 			allDone = false;
@@ -135,7 +136,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 			for (int portNum : listOfPorts) {
 				/* Count how many ACKs have been received */
-				ackCount += ((ackChecker.get(msgKey + "###" + String.valueOf(portNum))) ? 1 : 0);
+				boolean gotAck = ackChecker.get(msgKey + "###" + String.valueOf(portNum));
+				ackCount += gotAck ? 1 : 0;
+				if (gotAck && !devicesThatSentAcks.contains(portNum))
+					devicesThatSentAcks.add(portNum);
 
 				/* Check if this AVD has timed out */
 				long timeNow = new Date().getTime();
@@ -149,9 +153,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 				allDone = true;
 
 			if (ackCount < listOfPorts.size()-1 && isTimedOut)
-				Log.e(TAG, "[" + mode + " for " + msgKey + "] " + " WHY IS THERE A TIMEOUT HERE ackCount = " + ackCount + "/" + listOfPorts.size());
+				Log.e(TAG, "[" + mode + " for " + msgKey + "] " + "WHY IS THERE A TIMEOUT HERE ackCount = " + ackCount + "/" + listOfPorts.size());
 
 		} while (!allDone && !isTimedOut);
+
+		Log.v(TAG, "[" + mode + " for " + msgKey + "] " + "Got responses from: " + devicesThatSentAcks);
 	}
 
 	@Override
@@ -230,7 +236,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 			/* -------- Wait for ACKs or until timeout */
 			waiter(msgKey, timestamps, replicaIDs, isQueryAnswered, "Query");
-			Log.v(TAG, "[Query for " + msgKey + "] " + "Got responses from everyone (or almost everyone)");
 
 			/* Query has been answered. */
 			List<String> resultList = new ArrayList<>();
@@ -251,12 +256,13 @@ public class SimpleDynamoProvider extends ContentProvider {
 					mostRecentResult = result;
 				}
 			}
+			Log.v(TAG, "[Query for " + msgKey + "] Most recent result ==> " + mostRecentResult);
 
 			/* Store the result in the matrix-cursor and return them. */
 			String[] columnValues = {msgKey, getActualValue(mostRecentResult)};
 			matrixCursor.addRow(columnValues);
 
-			Log.v(TAG, "[Query for " + msgKey + "] Complete. No. of rows retrieved ==> " + matrixCursor.getCount());
+			Log.v(TAG, "[Query for " + msgKey + "] Complete. Result ==> " + mostRecentResult);
 		}
 
 		return matrixCursor;
@@ -544,7 +550,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 					Log.d(TAG, "[Recovery] Got recovery aid from " + sendersPortNum12 + " ==> " + keyValuePairsString12);
 
 					Map<String, String> resultsMap = new HashMap<>();
-					putAllKeyValuePairsIntoMap(keyValuePairsString12, resultsMap);
+					putAllKeyValuePairsIntoMap(keyValuePairsString12, resultsMap, true);
 
 					for (String key: resultsMap.keySet()) {
 						/* Ignore the version, and put the actual value */
@@ -785,6 +791,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 	}
 
 	public void putAllKeyValuePairsIntoMap(String aggregatedString, Map<String, String> resultsMap) {
+		putAllKeyValuePairsIntoMap(aggregatedString, resultsMap, false);
+	}
+	public void putAllKeyValuePairsIntoMap(String aggregatedString, Map<String, String> resultsMap, boolean checkLocally) {
 
 		if (aggregatedString.contains(",")) {
 			String[] splitted = aggregatedString.trim().split(",");
@@ -795,16 +804,31 @@ public class SimpleDynamoProvider extends ContentProvider {
 					String[] keyValue = kvPair.split("===");
 					String key = keyValue[0];
 					String value = keyValue[1];
+					int thisVersion = getVersion(value);
 
 					/* If another AVD had already sent a value for this key,
 					 * make sure we have the most recent version */
-					if (resultsMap.containsKey(key)) {
+					/* No need to check this for recovery mode, because
+					 * at a time only 1 AVD's stuff would be in this method*/
+ 					if (!checkLocally && resultsMap.containsKey(key)) {
 						int existingVersion = getVersion(resultsMap.get(key));
-						int thisVersion = getVersion(value);
 
 						/* If this version is older than the existing one, keep the existing one */
 						if (thisVersion < existingVersion)
 							value = resultsMap.get(key);
+					}
+
+					/* Check if a more recent version exists locally */
+					if (checkLocally) {
+						String localValue = readFromInternalStorage(key);
+						/* Does a local value exist for this key? */
+						if (!localValue.isEmpty()) {
+							int existingVersion = getVersion(localValue);
+
+							/* If this version is older than the existing one, keep the existing one */
+							if (thisVersion < existingVersion)
+								value = localValue;
+						}
 					}
 
 					resultsMap.put(key, value);
