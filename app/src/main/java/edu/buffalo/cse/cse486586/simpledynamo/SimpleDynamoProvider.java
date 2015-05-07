@@ -96,19 +96,19 @@ public class SimpleDynamoProvider extends ContentProvider {
 	public int delete(Uri uri, String msgKey, String[] selectionArgs) {
 	    /* Only need to use the first two parameters, uri & selection */
 
-		if (msgKey.equals("\"*\"")) {
+		if (msgKey.contains("*")) {
 		    /* If “*” is given as the selection parameter to delete(),
 		       then you need to delete all <key, value> pairs stored in your entire DHT. */
 
 			for (int portNum : PORT_ID_LIST)
 				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DELETE_STAR_REQUEST), String.valueOf(portNum));
 
-		} else if (msgKey.equals("\"@\"")) {
+		} else if (msgKey.contains("@")) {
 		    /* Delete all files on the local partition */
 
 			for (String key : context.fileList())
 				if (!key.equals(DUMMY_FILE_NAME))
-					context.deleteFile(key);
+					deleteThisFile(key);
 			//keysInsertedLocally.clear();
 
 		} else {
@@ -116,7 +116,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			int coordinatorPortId = whereDoesItBelong(msgKey);
 			List<Integer> replicaIDs = getThreeReplicaIDs(coordinatorPortId, PORT_ID_LIST);
 
-			Log.d(TAG, "[Insert] " + msgKey + " ==> Sending DELETE request to => " + replicaIDs);
+			Log.d(TAG, "[Delete] " + msgKey + " ==> Sending DELETE request to => " + replicaIDs);
 			for (int replicaID : replicaIDs)
 				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DELETE_SINGLE_KEY_REQUEST), msgKey, String.valueOf(replicaID));
 		}
@@ -172,7 +172,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		String[] columnNames = {"key", "value"};
 		MatrixCursor matrixCursor = new MatrixCursor(columnNames);
 
-		if (msgKey.equals("\"*\"")) {
+		if (msgKey.contains("*")) {
 
 			//synchronized (this) {
 				Map<String, Long> timestamps = new HashMap<>();
@@ -205,7 +205,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 				Log.v(TAG, "Query for '*' complete. No. of rows retrieved ==> " + matrixCursor.getCount());
 			//}
 
-		} else if (msgKey.equals("\"@\"")) {
+		} else if (msgKey.contains("@")) {
 			Log.v(TAG, "Query for '@' received");
 
 			if (amIRecovering) {
@@ -251,13 +251,15 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 			/* Find the most recent result (the latest version) */
 			String mostRecentResult = "";
-			int latestVersion = 0;
+			long latestVersion = 0;
 			for (String result: resultList) {
 				/* Get latest version from all the replies */
-				int thisVersion = getVersion(result);
-				if (thisVersion > latestVersion) {
-					latestVersion = thisVersion;
-					mostRecentResult = result;
+				if (result != null && !result.trim().isEmpty()) {
+					long thisVersion = getVersion(result);
+					if (thisVersion > latestVersion) {
+						latestVersion = thisVersion;
+						mostRecentResult = result;
+					}
 				}
 			}
 			Log.v(TAG, "[Query for " + msgKey + "] Most recent result ==> " + mostRecentResult);
@@ -375,7 +377,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 							String msgKey7 = incoming[1];
 							String originatorsPort7 = incoming[2];
 
-							context.deleteFile(msgKey7);
+							deleteThisFile(msgKey7);
+							Log.d(TAG, "[Delete]" + msgKey7 + "] has been deleted.");
 							break;
 
 						case DELETE_STAR_REQUEST: /* 8 */
@@ -385,7 +388,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 							for (String key : context.fileList())
 								if (!key.equals(DUMMY_FILE_NAME))
-									context.deleteFile(key);
+									deleteThisFile(key);
 
 							break;
 
@@ -512,7 +515,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 					/* Put only those key-value pairs that actually belong at the recovering AVD */
 					String allMyStuff = getAllMyStuff(true, idOfRecoveringDevice);
 					String messageToBeSent10 = Mode.RECOVERY_INFORMATION.toString() + "##" + allMyStuff + "##" + String.valueOf(myPortNumber);
-					Log.d(TAG, "[Recovery] Sending my stuff to the recovering AVD ==> " + allMyStuff);
+					Log.d(TAG, "[Recovery] Sending my stuff to the recovering AVD [" + idOfRecoveringDevice + "]==> " + allMyStuff);
 
 					sendOnSocket(messageToBeSent10, idOfRecoveringDevice * 2);
 					break;
@@ -526,12 +529,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 					Log.d(TAG, "[Insert for " + msgKey11 + "]" + " belongs here. WRITING value [" + msgValue11 + "]");
 
 					/* Get the current version */
-					int version = 1;
+					long version = new Date().getTime();
 					String currentData = readFromInternalStorage(msgKey11);
 					if (!currentData.isEmpty()) {
-						int existingVersion = getVersion(currentData);
+						long existingVersion = getVersion(currentData);
 						Log.d(TAG, "[Insert for " + msgKey11 + "]" + " Existing version ==> " + existingVersion);
-						version = 1 + getVersion(currentData);
+						//version = getVersion(currentData);
 					} else
 						Log.d(TAG, "[Insert for " + msgKey11 + "]" + " No existing version. New data ==> " + String.valueOf(version) + "@@@" + msgValue11);
 
@@ -699,8 +702,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return uriBuilder.build();
 	}
 
-	private int getVersion(String content) {
-		return Integer.parseInt(content.substring(0, content.indexOf("@@@")));
+	private long getVersion(String content) {
+		return Long.parseLong(content.substring(0, content.indexOf("@@@")));
 	}
 
 	private String getActualValue(String content) {
@@ -808,14 +811,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 					String[] keyValue = kvPair.split("===");
 					String key = keyValue[0];
 					String value = keyValue[1];
-					int thisVersion = getVersion(value);
+					long thisVersion = getVersion(value);
 
 					/* If another AVD had already sent a value for this key,
 					 * make sure we have the most recent version */
 					/* No need to check this for recovery mode, because
 					 * at a time only 1 AVD's stuff would be in this method*/
  					if (!checkLocally && resultsMap.containsKey(key)) {
-						int existingVersion = getVersion(resultsMap.get(key));
+						long existingVersion = getVersion(resultsMap.get(key));
 
 						/* If this version is older than the existing one, keep the existing one */
 						if (thisVersion < existingVersion)
@@ -827,7 +830,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 						String localValue = readFromInternalStorage(key);
 						/* Does a local value exist for this key? */
 						if (!localValue.isEmpty()) {
-							int existingVersion = getVersion(localValue);
+							long existingVersion = getVersion(localValue);
 
 							/* If this version is older than the existing one, keep the existing one */
 							if (thisVersion < existingVersion)
@@ -849,6 +852,19 @@ public class SimpleDynamoProvider extends ContentProvider {
 			String[] columnValues = {key, actualValue};
 			matrixCursor.addRow(columnValues);
 		}
+	}
+
+	private void deleteThisFile(String key) {
+		//context.deleteFile(key);
+		boolean deleted = false, exists;
+
+		File file = context.getFileStreamPath(key);
+		exists = file.exists();
+		if (exists)
+			deleted = file.delete();
+
+		if (!deleted && exists)
+			Log.e("ERROR " + TAG, "Unable to delete file: " + key);
 	}
 
 	public enum Mode {
