@@ -27,16 +27,14 @@ import java.util.Formatter;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
 
 public class SimpleDynamoProvider extends ContentProvider {
-
-	final int TIMEOUT = 3000;
 
 	/* Key = <query_key###portNumOfTarget> */
 	static Map<String, Boolean> isQueryAnswered = new HashMap<>();
 	static Map<String, String> resultOfMyQuery = new HashMap<>();
 	static Map<String, Boolean> acksReceivedForInsert = new HashMap<>();
-	/* TODO: Might need to make mutexes for the 3 maps above */
 
 	/* Constants, and stuff that will be set in onCreate */
 	Context context;
@@ -50,6 +48,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	static boolean amIRecovering;
 	static int recoveryAidsReceived;
+	static List<Integer> deadDevices = new ArrayList<>();
 
 	@Override
 	public boolean onCreate() {
@@ -71,12 +70,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 		try {
 			ServerSocket serverSocket = new ServerSocket(10000);
 			new ServerTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, serverSocket);
+			//new ServerTask().executeOnExecutor(Executors.newFixedThreadPool(10), serverSocket);
 		} catch (IOException e) {
 			Log.e(TAG, "Can't create a ServerSocket");
 			Log.getStackTraceString(e);
 			return false;
 		}
-
 
 		/* Is this the 1st time or am I recovering? */
 		amIRecovering = amIRecovering();
@@ -85,7 +84,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 		if (amIRecovering) {
 			/* Send recovering messages to everyone */
 			Log.d(TAG, "[Recovery] I am recovering. Asking everyone for their stuff.");
-			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.REQUEST_RECOVERY_INFO));
+			for (int destinationPort : PORT_ID_LIST)
+				if (myPortNumber != destinationPort)
+					new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.REQUEST_RECOVERY_INFO), String.valueOf(destinationPort));
 		} else
 			Log.d(TAG, "[Not recovery] I am NOT recovering. This is my first time starting up.");
 
@@ -96,14 +97,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 	public int delete(Uri uri, String msgKey, String[] selectionArgs) {
 	    /* Only need to use the first two parameters, uri & selection */
 
-		if (msgKey.contains("*")) {
+		if (msgKey.equals("\"*\"")) {
 		    /* If “*” is given as the selection parameter to delete(),
 		       then you need to delete all <key, value> pairs stored in your entire DHT. */
 
 			for (int portNum : PORT_ID_LIST)
 				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DELETE_STAR_REQUEST), String.valueOf(portNum));
 
-		} else if (msgKey.contains("@")) {
+		} else if (msgKey.equals("\"@\"")) {
 		    /* Delete all files on the local partition */
 
 			for (String key : context.fileList())
@@ -124,11 +125,26 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return 0;
 	}
 
-	private void waiter(String msgKey, Map<String, Long> timestamps, List<Integer> listOfPorts, Map<String, Boolean> ackChecker, String mode) {
+	private void deleteThisFile(String key) {
+		// **************** TODO: Check if the delete mechanism works
+		//context.deleteFile(key);
+		boolean deleted = false, exists = false;
+
+		File file = context.getFileStreamPath(key);
+		exists = file.exists();
+		if (exists)
+			deleted = file.delete();
+
+		if (!deleted && exists)
+			Log.e("ERROR " + TAG, "Unable to delete file: " + key);
+	}
+
+	private void waiter(String msgKey, List<Integer> listOfPorts, Map<String, Boolean> ackChecker, String mode) {
 		Log.v(TAG, "[" + mode + " for " + msgKey + "] " + "Waiting for everyone to reply...");
 		boolean allDone, isTimedOut;
 		int ackCount;
 		List<Integer> devicesThatSentAcks = new ArrayList<>();
+		List<Integer> devicesThatTimedOut = new ArrayList<>();
 		do {
 			ackCount = 0;
 			allDone = false;
@@ -140,15 +156,17 @@ public class SimpleDynamoProvider extends ContentProvider {
 				boolean gotAck = ackChecker.get(msgKey + "###" + String.valueOf(portNum));
 				/* Count how many ACKs have been received */
 				ackCount += gotAck ? 1 : 0;
-				if (gotAck && !devicesThatSentAcks.contains(portNum))
+				if (gotAck && !devicesThatSentAcks.contains(portNum)) {
 					devicesThatSentAcks.add(portNum);
+					Log.d(TAG, "[" + mode + " for " + msgKey + "] " + portNum + " just sent an ACK.");
+				}
 
-				/* No ack from this AVD. Check if it's timed out */
-				if (!gotAck) {
-					long timeNow = new Date().getTime();
-					if (timeNow - timestamps.get(msgKey + "###" + String.valueOf(portNum)) >= TIMEOUT) {
-						isTimedOut = true;
-						Log.d(TAG, "[" + mode + " for " + msgKey + "] " + "TIMEOUT on node: " + portNum);
+				/* No ack from this AVD. Is it dead? */
+				if (!gotAck && deadDevices.contains(portNum)) {
+					isTimedOut = true;
+					if (!devicesThatTimedOut.contains(portNum)) {
+						devicesThatTimedOut.add(portNum);
+						Log.d(TAG, "[" + mode + " for " + msgKey + "] " + portNum + " TIMED OUT");
 					}
 				}
 			}
@@ -156,12 +174,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 			if (ackCount == listOfPorts.size())
 				allDone = true;
 
-			if (ackCount < listOfPorts.size()-1 && isTimedOut)
-				Log.e("STRANGE " + TAG, "[" + mode + " for " + msgKey + "] " + "WHY IS THERE A TIMEOUT HERE ackCount = " + ackCount + "/" + listOfPorts.size());
-
 		} while (!allDone && !(isTimedOut && ackCount == listOfPorts.size()-1));
 
-		Log.v(TAG, "[" + mode + " for " + msgKey + "] " + "Got responses from: " + devicesThatSentAcks);
+		Log.d(TAG, "[" + mode + " for " + msgKey + "] " + "Got responses from: " + devicesThatSentAcks);
+		if (!devicesThatTimedOut.isEmpty())
+			Log.d(TAG, "[" + mode + " for " + msgKey + "] " + "These devices TIMED OUT: " + devicesThatTimedOut);
 	}
 
 	@Override
@@ -172,10 +189,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		String[] columnNames = {"key", "value"};
 		MatrixCursor matrixCursor = new MatrixCursor(columnNames);
 
-		if (msgKey.contains("*")) {
-
-			//synchronized (this) {
-				Map<String, Long> timestamps = new HashMap<>();
+		if (msgKey.equals("\"*\"")) {
 
 				/* Ask everyone for their stuff */
 				for (int portNum : PORT_ID_LIST) {
@@ -183,12 +197,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 					isQueryAnswered.put("*" + "###" + String.valueOf(portNum), false);
 
 					new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.QUERY_STAR_REQUEST), String.valueOf(portNum));
-					timestamps.put("*" + "###" + String.valueOf(portNum), new Date().getTime());
 				}
 
 				/* -------- Wait until the query is answered by ALL */
-				waiter("*", timestamps, PORT_ID_LIST, isQueryAnswered, "Query");
-				Log.v(TAG, "Got responses from everyone (or almost everyone) for the '*' query");
+				/* TODO: FIX here */
+				waiter("*", PORT_ID_LIST, isQueryAnswered, "Query");
 
 				/* The "*" query has been answered by all. Store the results in the cursor and return them. */
 				/* Split up the key-value pairs in "resultOfMyQuery" */
@@ -203,16 +216,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 				putMapInMatrixCursor(resultsMap, matrixCursor);
 
 				Log.v(TAG, "Query for '*' complete. No. of rows retrieved ==> " + matrixCursor.getCount());
-			//}
 
-		} else if (msgKey.contains("@")) {
+		} else if (msgKey.equals("\"@\"")) {
 			Log.v(TAG, "Query for '@' received");
 
-			if (amIRecovering) {
-				Log.d(TAG, "[Query for @] I'm still in recovery. Waiting until recovery is complete.");
-				while(amIRecovering);
-				Log.d(TAG, "[Query for @] Recovery complete. Proceeding.");
-			}
+			waitUntilRecoveryIsComplete("Query", "@");
 
 			/* Return all key-value pairs on this local partition */
 			for (String key : context.fileList())
@@ -227,19 +235,23 @@ public class SimpleDynamoProvider extends ContentProvider {
 			int coordinatorPortId = whereDoesItBelong(msgKey);
 			List<Integer> replicaIDs = getThreeReplicaIDs(coordinatorPortId, PORT_ID_LIST);
 
-			/*  Keep track of time stamps */
-			Map<String, Long> timestamps = new HashMap<>();
-
 			Log.d(TAG, "[Query for " + msgKey + "] " + "Sending query requests to => " + replicaIDs);
 			for (int replicaID : replicaIDs) {
 				isQueryAnswered.put(msgKey + "###" + String.valueOf(replicaID), false);
 
-				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.QUERY_FIND_REQUEST), msgKey, String.valueOf(replicaID));
-				timestamps.put(msgKey + "###" + String.valueOf(replicaID), new Date().getTime());
+				if (replicaID == myPortNumber) {
+					Log.d(TAG, "[Query for " + msgKey + "] One of the replicas is me. Querying on self.");
+
+					/* Wait until recovery is complete */
+					waitUntilRecoveryIsComplete("Query", msgKey);
+					String msgValue = readFromInternalStorage(msgKey);
+					dealWithQueryResponse("x##" + msgKey + "##" + msgValue + "##" + String.valueOf(myPortNumber), msgKey, myPortNumber);
+				} else
+					new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.QUERY_FIND_REQUEST), msgKey, String.valueOf(replicaID));
 			}
 
 			/* -------- Wait for ACKs or until timeout */
-			waiter(msgKey, timestamps, replicaIDs, isQueryAnswered, "Query");
+			waiter(msgKey, replicaIDs, isQueryAnswered, "Query");
 
 			/* Query has been answered. */
 			List<String> resultList = new ArrayList<>();
@@ -262,8 +274,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 					}
 				}
 			}
-			Log.v(TAG, "[Query for " + msgKey + "] Most recent result ==> " + mostRecentResult);
-
 			/* Store the result in the matrix-cursor and return them. */
 			String[] columnValues = {msgKey, getActualValue(mostRecentResult)};
 			matrixCursor.addRow(columnValues);
@@ -274,35 +284,41 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return matrixCursor;
 	}
 
+	private void waitUntilRecoveryIsComplete(String mode, String key) {
+		if (amIRecovering) {
+			Log.d(TAG, "[" + mode + " for " + key + "] I'm still in recovery. Waiting until recovery is complete.");
+			while(amIRecovering);
+			Log.d(TAG, "[" + mode + " for " + key + "] Recovery complete. Proceeding.");
+		}
+	}
+
 	@Override
 	public Uri insert(Uri uri, ContentValues values) {
 
-		//synchronized (this) {
 			String msgKey = (String) values.get("key");
 			String msgValue = (String) values.get("value");
 
 			/* Find out where it belongs */
 			int coordinatorPortId = whereDoesItBelong(msgKey);
 			List<Integer> replicaIDs = getThreeReplicaIDs(coordinatorPortId, PORT_ID_LIST);
-
-			/* Keep track of time stamps */
-			Map<String, Long> timestamps = new HashMap<>();
-
 			Log.d(TAG, "[Insert for " + msgKey + "] Sending insert requests to => " + replicaIDs);
+
 			for (int replicaID : replicaIDs) {
 				/* Key = <message_key###portNumOfTarget> */
-				acksReceivedForInsert.put(msgKey + "###" + String.valueOf(replicaID), false);
-
-				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.INSERT_REQUEST), msgKey, msgValue, String.valueOf(replicaID));
-				timestamps.put(msgKey + "###" + String.valueOf(replicaID), new Date().getTime());
+				if (replicaID == myPortNumber) {
+					Log.d(TAG, "[Insert for " + msgKey + "] One of the replicas is me. Inserting on self.");
+					doInsertion(msgKey, msgValue);
+					acksReceivedForInsert.put(msgKey + "###" + myPortNumber, true);
+				} else {
+					acksReceivedForInsert.put(msgKey + "###" + String.valueOf(replicaID), false);
+					new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.INSERT_REQUEST), msgKey, msgValue, String.valueOf(replicaID));
+				}
 			}
 
 			/* -------- Wait for ACKs or until timeout */
-			waiter(msgKey, timestamps, replicaIDs, acksReceivedForInsert, "Insert");
-			Log.v(TAG, "[Insert for " + msgKey + "] " + "Got responses from everyone (or almost everyone)");
+			waiter(msgKey, replicaIDs, acksReceivedForInsert, "Insert");
 
 			return null;
-		//}
 	}
 
 	@Override
@@ -322,108 +338,127 @@ public class SimpleDynamoProvider extends ContentProvider {
 		protected Void doInBackground(ServerSocket... sockets) {
 			ServerSocket serverSocket = sockets[0];
 
-            /* Server code that receives messages and passes them to onProgressUpdate(). */
-			Socket clientSocket;
-
 			try {
 				while (true) {
-					clientSocket = serverSocket.accept();
+					Socket clientSocket = serverSocket.accept();
 
 					BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
 					String incomingString = bufferedReader.readLine();
 
-					if (incomingString != null) {
-						String incoming[] = incomingString.split("##");
-						Mode mode = Mode.valueOf(incoming[0]);
-
-						switch (mode) {
-
-							case INSERT_REQUEST: /* 3 */
-								/* A request for insertion received.
-								 * Message structure ===> <mode> ## <key> ## <value> ## <originator's port> */
-
-								String msgKey3 = incoming[1];
-								String msgValue3 = incoming[2];
-								String originatorsPortId3 = incoming[3];
-
-								new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DO_INSERTION), msgKey3, msgValue3, originatorsPortId3);
-								break;
-
-							case QUERY_FIND_REQUEST: /* 4 */
-								String originatorPortId4 = incoming[1];
-								String keyToFind4 = incoming[2];
-
-								new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.QUERY_RESULT_FOUND), originatorPortId4, keyToFind4);
-								break;
-
-							case QUERY_RESULT_FOUND: /* 5 */
-								String msgKey5 = incoming[1];
-								String msgValue5 = incoming[2];
-								String sendersId5 = incoming[3];
-
-								resultOfMyQuery.put(msgKey5 + "###" + sendersId5, msgValue5);
-								isQueryAnswered.put(msgKey5 + "###" + sendersId5, true);
-								Log.d(TAG, "[Query result found for " + msgKey5 + "] Value = " + msgValue5 + " [Sender: "+ sendersId5 + "]");
-								break;
-
-							case QUERY_STAR_REQUEST: /* 6 */
-								String originatorPortId6 = incoming[1];
-
-								new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DO_STAR_QUERY), originatorPortId6);
-								break;
-
-							case DELETE_SINGLE_KEY_REQUEST: /* 7 */
-								/* The key is on THIS partition. Delete it */
-								String msgKey7 = incoming[1];
-								String originatorsPort7 = incoming[2];
-
-								deleteThisFile(msgKey7);
-								Log.d(TAG, "[Delete]" + msgKey7 + "] has been deleted.");
-								break;
-
-							case DELETE_STAR_REQUEST: /* 8 */
-								/* Delete everything locally */
-
-								String originatorsPort8 = incoming[1];
-
-								for (String key : context.fileList())
-									if (!key.equals(DUMMY_FILE_NAME))
-										deleteThisFile(key);
-
-								break;
-
-							case ACK_FOR_INSERT: /* 9 */
-								/* ACK received (I'm the originator). Set flag = true */
-								String msgKey9 = incoming[1];
-								String idOfAckSender9 = incoming[2];
-
-								/* Put the ACK in some static data structure */
-								acksReceivedForInsert.put(msgKey9 + "###" + idOfAckSender9, true);
-								break;
-
-							case REQUEST_RECOVERY_INFO: /* 10 */
-								String originatorPortId10 = incoming[1];
-
-								/* Need to send all my stuff to the originator */
-								new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.RECOVERY_INFORMATION), originatorPortId10);
-								break;
-
-							case RECOVERY_INFORMATION: /* 11 */
-
-								/* [I'm the recovering AVD]
-								 * Store all the stuff that's been sent to me here */
-	 							String keyValuePairsString = incoming[1];
-								String sendersPortNum11 = incoming[2];
-
-								new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DO_RECOVERY), keyValuePairsString, sendersPortNum11);
-								break;
-						}
-					}
+					new BackgroundRunnerTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, incomingString, clientSocket);
 				}
 			} catch (IOException e) {
 				Log.e("ERROR " + TAG, Log.getStackTraceString(e));
 			}
 
+			return null;
+		}
+	}
+
+	private class BackgroundRunnerTask extends AsyncTask<Object, Void, Void> {
+
+		@Override
+		protected Void doInBackground(Object... params) {
+
+			String incomingString = (String) params[0];
+			Socket clientSocket = (Socket) params[1];
+
+			//Log.d(TAG, "Incoming ==> " + incomingString);
+			String incoming[] = incomingString.split("##");
+			Mode mode = Mode.valueOf(incoming[0]);
+
+			try {
+				switch (mode) {
+
+					case INSERT_REQUEST: /* 3 */
+					/* A request for insertion received.
+					 * Message structure ===> <mode> ## <key> ## <value> ## <originator's port> */
+						final String msgKey3 = incoming[1];
+						final String msgValue3 = incoming[2];
+
+					/* Do the insertion */
+					/* Since it belongs here, write the content values to internal storage */
+						Log.d(TAG, "[Insert for " + msgKey3 + "]" + " Insert request received.");
+						String ackMessage3 = doInsertion(msgKey3, msgValue3);
+
+						if (ackMessage3 == null)
+							ackMessage3 = " ";
+
+					/* Send ACK on the same socket*/
+						Log.d(TAG, "[Insert for " + msgKey3 + "] Wrote the value (" + msgValue3 + "). Sending ACK.");
+						sendOnExistingSocket(clientSocket, ackMessage3);
+						break;
+
+					case QUERY_FIND_REQUEST: /* 4 */
+					/* The key is present here. Get it's value and inform the originator */
+						String originatorPortId4 = incoming[1];
+						String keyToFind4 = incoming[2];
+
+					/* Wait until recovery is complete */
+						waitUntilRecoveryIsComplete("Insert", keyToFind4);
+
+						String queryResult5 = readFromInternalStorage(keyToFind4);
+						Log.d(TAG, "[Query for " + keyToFind4 + "] This key was found here. Sending back value [" + queryResult5 + "] to originator => " + originatorPortId4);
+
+					/* Send ACK on the same socket*/
+						String messageToBeSent5 = Mode.QUERY_RESULT_FOUND.toString() + "##" + keyToFind4 + "##" + queryResult5 + "##" + String.valueOf(myPortNumber);
+						sendOnExistingSocket(clientSocket, messageToBeSent5);
+						break;
+
+					case QUERY_STAR_REQUEST: /* 6 */
+					/* Get ALL the key-value pairs stored on this device */
+						String aggregatedResult6 = getAllMyStuff();
+						Log.d(TAG, "Appended my stuff to the '*' query ==> " + aggregatedResult6);
+
+					/* Send everything back to the originator */
+						String messageToBeSent6 = Mode.QUERY_RESULT_FOUND.toString() + "##" + "*" + "##" + aggregatedResult6 + "##" + String.valueOf(myPortNumber);
+						sendOnExistingSocket(clientSocket, messageToBeSent6);
+						break;
+
+					case DELETE_SINGLE_KEY_REQUEST: /* 7 */
+							/* The key is on THIS partition. Delete it */
+						String msgKey7 = incoming[1];
+
+						deleteThisFile(msgKey7);
+						break;
+
+					case DELETE_STAR_REQUEST: /* 8 */
+							/* Delete everything locally */
+
+						for (String key : context.fileList())
+							if (!key.equals(DUMMY_FILE_NAME))
+								deleteThisFile(key);
+
+						break;
+
+					case REQUEST_RECOVERY_INFO: /* 10 */
+					/* Someone just recovered. Mark them as NOT DEAD */
+						int idOfRecoveringDevice = Integer.parseInt(incoming[1]);
+						if (deadDevices.contains(Integer.valueOf(idOfRecoveringDevice)))
+							deadDevices.remove(Integer.valueOf(idOfRecoveringDevice));
+
+					/* Need to send all my stuff to the recovering AVD */
+					/* Put only those key-value pairs that actually belong at the recovering AVD */
+						String allMyStuff = getAllMyStuff(true, idOfRecoveringDevice);
+						String messageToBeSent10 = Mode.RECOVERY_INFORMATION.toString() + "##" + allMyStuff;
+
+						Log.d(TAG, "[Recovery] Sending my stuff to the recovering AVD [" + idOfRecoveringDevice + "] ==> " + allMyStuff);
+						sendOnExistingSocket(clientSocket, messageToBeSent10);
+						break;
+
+					case RECOVERY_INFORMATION: /* 11 */
+
+					/* [I'm the recovering AVD]
+					 * Store all the stuff that's been sent to me here */
+						String keyValuePairsString = incoming[1];
+						String sendersPortNum11 = incoming[2];
+
+						new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, String.valueOf(Mode.DO_RECOVERY), keyValuePairsString, sendersPortNum11);
+						break;
+				}
+			} catch (IOException e) {
+				Log.e("ERROR " + TAG, Log.getStackTraceString(e));
+			}
 			return null;
 		}
 	}
@@ -435,159 +470,180 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 			String modeString = (String) params[0];
 			Mode mode = Mode.valueOf(modeString);
+			Socket sock = null;
+			String msgKey, msgValue;
+			int destinationPort;
+			String messageToBeSent, incomingString;
 
-			switch (mode) {
+			try {
+				switch (mode) {
 
-				case INSERT_REQUEST: /* 3 */
-					/* Construct message as ===> <mode> ## <key> ## <value> */
-					String msgKey3 = (String) params[1];
-					String msgValue3 = (String) params[2];
-					String destinationPort3 = (String) params[3];
-					String messageToBeSent3 = Mode.INSERT_REQUEST.toString() + "##" + msgKey3 + "##" + msgValue3 + "##" + String.valueOf(myPortNumber);
+					case INSERT_REQUEST: /* 1 */
+						/* Construct message as ===> <mode> ## <key> ## <value> */
+						msgKey = (String) params[1];
+						msgValue = (String) params[2];
+						destinationPort = Integer.parseInt((String) params[3]);
+						messageToBeSent = Mode.INSERT_REQUEST.toString() + "##" + msgKey + "##" + msgValue;
 
-					sendOnSocket(messageToBeSent3, Integer.parseInt(destinationPort3) * 2);
-					break;
+						Log.d(TAG, "[Insert for " + msgKey + "] Sending request to: " + destinationPort);
+						sock = sendOnNewSocket(messageToBeSent, destinationPort * 2);
 
-				case QUERY_FIND_REQUEST: /* 4 */
-					String keyToFind4 = (String) params[1];
-					int destinationPortId4 = Integer.parseInt((String) params[2]);
-					String originator4 = String.valueOf(myPortNumber);
+						/* ACK received (I'm the originator) */
+						incomingString = readFromSocket(sock);
+						if (incomingString != null) {
+							Log.d(TAG, "[Insert for " + msgKey + "] ACK received from " + destinationPort + ": " + incomingString);
+							String incoming[] = incomingString.split("##");
+							String idOfAckSender = incoming[1];
+							acksReceivedForInsert.put(msgKey + "###" + idOfAckSender, true);
+						} else {
+							/* Device is DEAD */
+							Log.d(TAG, "[Insert for " + msgKey + "] " + destinationPort + " DIED during the insertion of key=" + msgKey + ", value=" + msgValue);
+							deadDevices.add(destinationPort);
+						}
 
-					String messageToBeSent4 = Mode.QUERY_FIND_REQUEST.toString() + "##" + originator4 + "##" + keyToFind4;
+						break;
 
-					sendOnSocket(messageToBeSent4, destinationPortId4 * 2);
-					break;
+					case QUERY_FIND_REQUEST: /* 2 */
+						String keyToFind2 = (String) params[1];
+						int destinationPortId2 = Integer.parseInt((String) params[2]);
+						String originator2 = String.valueOf(myPortNumber);
 
-				case QUERY_RESULT_FOUND: /* 5 */
-					/* The key in the query was found here. Give it's value to the originator */
-					String originatorPortId5 = (String) params[1];
-					String keyToFind5 = (String) params[2];
+						Log.d(TAG, "[Query for " + keyToFind2 + "] Sending request to: " + destinationPortId2);
+						String messageToBeSent2 = Mode.QUERY_FIND_REQUEST.toString() + "##" + originator2 + "##" + keyToFind2;
+						sock = sendOnNewSocket(messageToBeSent2, destinationPortId2 * 2);
 
-					/* The key is present here. Get it's value and inform the originator */
-					String queryResult5 = readFromInternalStorage(keyToFind5);
-					Log.d(TAG, "[Query] " + keyToFind5 + " ==> belongs here. Sending back value [" + queryResult5 + "] to originator => " + originatorPortId5);
+						/* Read ACK */
+						String incomingString2 = readFromSocket(sock);
+						dealWithQueryResponse(incomingString2, keyToFind2, destinationPortId2);
 
-					String messageToBeSent5 = Mode.QUERY_RESULT_FOUND.toString() + "##" + keyToFind5 + "##" + queryResult5 + "##" + String.valueOf(myPortNumber);
-					sendOnSocket(messageToBeSent5, Integer.parseInt(originatorPortId5) * 2);
+						break;
 
-					break;
+					case QUERY_STAR_REQUEST: /* 3 */
+						/* Ask the AVD on the destination port to add on ALL his key-value pairs */
+						int destinationPortId3 = Integer.parseInt((String) params[1]);
+						String originator3 = String.valueOf(myPortNumber);
 
-				case QUERY_STAR_REQUEST: /* 6 */
-					/* Ask the AVD on the destination port to add on ALL his key-value pairs */
-					int destinationPortId6 = Integer.parseInt((String) params[1]);
-					String originator6 = String.valueOf(myPortNumber);
+						String messageToBeSent3 = Mode.QUERY_STAR_REQUEST.toString() + "##" + originator3;
 
-					String messageToBeSent6 = Mode.QUERY_STAR_REQUEST.toString() + "##" + originator6;
+						Log.d(TAG, "Sending '*' query to " + destinationPortId3);
+						sock = sendOnNewSocket(messageToBeSent3, destinationPortId3 * 2);
 
-					Log.d(TAG, "Sending '*' query to " + destinationPortId6 * 2);
-					sendOnSocket(messageToBeSent6, destinationPortId6 * 2);
-					break;
+						/* Read ACK */
+						String incomingString3 = readFromSocket(sock);
+						if (incomingString3 != null) {
+							String incoming[] = incomingString3.split("##");
+							String msgKey3 = incoming[1];
+							String msgValue3 = incoming[2];
+							String sendersId3 = incoming[3];
 
-				case DELETE_SINGLE_KEY_REQUEST: /* 7 */
-					/* Construct message as ===> <mode> ## <key> ## <value> */
-					String msgKey7 = (String) params[1];
-					String destinationPort7 = (String) params[2];
-					String messageToBeSent7 = Mode.DELETE_SINGLE_KEY_REQUEST.toString() + "##" + msgKey7 + "##" + String.valueOf(myPortNumber);
+							resultOfMyQuery.put(msgKey3 + "###" + sendersId3, msgValue3);
+							isQueryAnswered.put(msgKey3 + "###" + sendersId3, true);
+							Log.d(TAG, "[Query result received for " + msgKey3 + "] "  + " [Sender: " + sendersId3 + "] Value = " + msgValue3);
+						} else {
+							/* Device is DEAD */
+							Log.d(TAG, destinationPortId3 + " DIED during the querying of *");
+							deadDevices.add(destinationPortId3);
+						}
+						break;
 
-					sendOnSocket(messageToBeSent7, Integer.parseInt(destinationPort7) * 2);
-					break;
+					case DELETE_SINGLE_KEY_REQUEST: /* 7 */
+						/* Construct message as ===> <mode> ## <key> ## <value> */
+						String msgKey7 = (String) params[1];
+						String destinationPort7 = (String) params[2];
+						String messageToBeSent7 = Mode.DELETE_SINGLE_KEY_REQUEST.toString() + "##" + msgKey7 + "##" + String.valueOf(myPortNumber);
 
-				case DELETE_STAR_REQUEST: /* 8 */
+						sock = sendOnNewSocket(messageToBeSent7, Integer.parseInt(destinationPort7) * 2);
+						break;
 
-					String destinationPort8 = (String) params[1];
-					String messageToBeSent8 = Mode.DELETE_STAR_REQUEST.toString() + "##" + String.valueOf(myPortNumber);
+					case DELETE_STAR_REQUEST: /* 8 */
 
-					sendOnSocket(messageToBeSent8, Integer.parseInt(destinationPort8) * 2);
-					break;
+						String destinationPort8 = (String) params[1];
+						String messageToBeSent8 = Mode.DELETE_STAR_REQUEST.toString() + "##" + String.valueOf(myPortNumber);
 
-				case REQUEST_RECOVERY_INFO: /* 9 */
-					/* Ask everyone (except me) for their recovery information */
-					String messageToBeSent9 = Mode.REQUEST_RECOVERY_INFO.toString() + "##" + String.valueOf(myPortNumber);
+						sock = sendOnNewSocket(messageToBeSent8, Integer.parseInt(destinationPort8) * 2);
+						break;
 
-					for (int destinationPort9: PORT_ID_LIST)
-						if (myPortNumber != destinationPort9)
-							sendOnSocket(messageToBeSent9, destinationPort9 * 2);
-					break;
+					case REQUEST_RECOVERY_INFO: /* 9 */
+						/* Ask everyone (except me) for their recovery information */
+						int destinationPort9 = Integer.parseInt((String) params[1]);
+						String messageToBeSent9 = Mode.REQUEST_RECOVERY_INFO.toString() + "##" + String.valueOf(myPortNumber);
 
-				case RECOVERY_INFORMATION: /* 10 */
-					/* Send all my stuff to the recovering AVD */
-					int idOfRecoveringDevice = Integer.parseInt((String) params[1]);
+						Log.d(TAG, "[Recovery] Asking " + destinationPort9 + " for it's information.");
+						sock = sendOnNewSocket(messageToBeSent9, destinationPort9 * 2);
 
-					/* Put only those key-value pairs that actually belong at the recovering AVD */
-					String allMyStuff = getAllMyStuff(true, idOfRecoveringDevice);
-					String messageToBeSent10 = Mode.RECOVERY_INFORMATION.toString() + "##" + allMyStuff + "##" + String.valueOf(myPortNumber);
-					Log.d(TAG, "[Recovery] Sending my stuff to the recovering AVD [" + idOfRecoveringDevice + "]==> " + allMyStuff);
+						/* Recovery response received */
+						String incomingString9 = readFromSocket(sock);
+						if (incomingString9 != null) {
+							String incoming[] = incomingString9.split("##");
 
-					sendOnSocket(messageToBeSent10, idOfRecoveringDevice * 2);
-					break;
+							if (incoming.length > 1) {
+								String keyValuePairsString12 = incoming[1];
+								Log.d(TAG, "[Recovery] Got recovery aid from " + destinationPort9 + " ==> " + keyValuePairsString12);
+								Map<String, String> resultsMap = new HashMap<>();
 
-				case DO_INSERTION: /* 11 */
-					String msgKey11 = (String) params[1];
-					String msgValue11 = (String) params[2];
-					int originatorsPortId11 = Integer.parseInt((String) params[3]);
+								putAllKeyValuePairsIntoMap(keyValuePairsString12, resultsMap, true);
 
-					/* Since it belongs here, write the content values to internal storage */
-					Log.d(TAG, "[Insert for " + msgKey11 + "]" + " belongs here. WRITING value [" + msgValue11 + "]");
+								for (String key : resultsMap.keySet())
+									writeToInternalStorage(key, resultsMap.get(key));
+							} else {
+								Log.d(TAG, "[Recovery] Got recovery aid from " + destinationPort9 + " ==> [BLANK]");
+							}
+							if (++recoveryAidsReceived == 4) {
+								Log.d(TAG, "[Recovery] Fully recovered.");
+								amIRecovering = false;
+							}
+						} else {
+							/* TODO: Device is DEAD */
+						}
+						break;
+				}
 
-					/* Get the current version */
-					long version = new Date().getTime();
-					String currentData = readFromInternalStorage(msgKey11);
-					if (!currentData.isEmpty()) {
-						long existingVersion = getVersion(currentData);
-						Log.d(TAG, "[Insert for " + msgKey11 + "]" + " Existing version ==> " + existingVersion);
-						//version = getVersion(currentData);
-					} else
-						Log.d(TAG, "[Insert for " + msgKey11 + "]" + " No existing version. New data ==> " + String.valueOf(version) + "@@@" + msgValue11);
-
-					/* Write to storage */
-					writeToInternalStorage(msgKey11, String.valueOf(version) + "@@@" + msgValue11);
-					//keysInsertedLocally.add(msgKey11);
-					//numOfKeysInserted++;
-
-					/* Send ACK to originator */
-					String messageToBeSent11 = Mode.ACK_FOR_INSERT.toString() + "##" + msgKey11 + "##" + String.valueOf(myPortNumber);
-					sendOnSocket(messageToBeSent11, originatorsPortId11 * 2);
-
-					break;
-
-				case DO_RECOVERY: /* 12 */
-					/* Got recovery aid from someone */
-
-					String keyValuePairsString12 = (String) params[1];
-					String sendersPortNum12 = (String) params[2];
-					Log.d(TAG, "[Recovery] Got recovery aid from " + sendersPortNum12 + " ==> " + keyValuePairsString12);
-
-					Map<String, String> resultsMap = new HashMap<>();
-					putAllKeyValuePairsIntoMap(keyValuePairsString12, resultsMap, true);
-
-					for (String key: resultsMap.keySet()) {
-						/* Ignore the version, and put the actual value */
-						String actualValue = resultsMap.get(key);
-						writeToInternalStorage(key, actualValue);
-					}
-
-					if (++recoveryAidsReceived == 4) {
-						Log.d(TAG, "[Recovery] Fully recovered.");
-						amIRecovering = false;
-					}
-
-					break;
-
-				case DO_STAR_QUERY: /* 13 */
-					String originatorPortId13 = (String) params[1];
-					/* Get ALL the key-value pairs stored on this device */
-					String aggregatedResult13 = getAllMyStuff();
-					Log.d(TAG, "Appended my stuff to the '*' query ==> " + aggregatedResult13);
-
-					/* Send everything back to the originator */
-					String messageToBeSent13 = Mode.QUERY_RESULT_FOUND.toString() + "##" + "*" + "##" + aggregatedResult13 + "##" + String.valueOf(myPortNumber);
-					sendOnSocket(messageToBeSent13, Integer.parseInt(originatorPortId13) * 2);
-					break;
+				if (sock != null)
+					sock.close();
+			} catch (IOException e) {
+				Log.e("ERROR " + TAG, Log.getStackTraceString(e));
 			}
 
 			return null;
 		}
 
+	}
+
+	private void dealWithQueryResponse(String incomingString2, String keyToFind2, int destinationPortId2) {
+		if (incomingString2 != null) {
+			String incoming[] = incomingString2.split("##");
+			String msgKey2 = incoming[1];
+			String msgValue2 = incoming[2];
+			String sendersId2 = incoming[3];
+
+			resultOfMyQuery.put(msgKey2 + "###" + sendersId2, msgValue2);
+			isQueryAnswered.put(msgKey2 + "###" + sendersId2, true);
+			Log.d(TAG, "[Query for " + msgKey2 + "] Value received from " + sendersId2 + " [" + msgValue2  + "]");
+		} else {
+			/* Device is DEAD */
+			Log.d(TAG, destinationPortId2 + " DIED during the querying of key=" + keyToFind2);
+			deadDevices.add(destinationPortId2);
+		}
+	}
+
+	private String doInsertion(String key, String value) {
+
+		/* Wait until recovery is complete */
+		waitUntilRecoveryIsComplete("Insert", key);
+
+		/* Get the current version */
+		long version = new Date().getTime();
+		String currentData = readFromInternalStorage(key);
+		if (!currentData.isEmpty()) {
+			Log.d(TAG, "[Insert for " + key + "]" + " Existing version ==> " + getVersion(currentData) + ". New version ==> " + version);
+		} else
+			Log.d(TAG, "[Insert for " + key + "]" + " No existing version. New data ==> " + String.valueOf(version) + "@@@" + value);
+
+		/* Write to storage */
+		writeToInternalStorage(key, String.valueOf(version) + "@@@" + value);
+
+		String ackMessage = key + "##" + String.valueOf(myPortNumber);
+		return ackMessage;
 	}
 
 
@@ -734,27 +790,54 @@ public class SimpleDynamoProvider extends ContentProvider {
 			columnValues[1] = fileContent;
 			matrixCursor.addRow(columnValues);
 		}
+		Log.d(TAG, "[Query for @] Adding key=" + key + ", value=" + contentRead + " to results.");
 	}
 
-	/* Send to successor */
-	private void sendOnSocket(String messageToBeSent, int destinationPort) {
+	public String readFromSocket(Socket socket) throws IOException {
+		String msgReceived = null;
+		BufferedReader bufferedReader = null;
+		try {
+			bufferedReader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+			msgReceived = bufferedReader.readLine();
+		} catch (IOException e) {
+			Log.e("ERROR " + TAG, Log.getStackTraceString(e));
+		} finally {
+			if (bufferedReader != null)
+				bufferedReader.close();
+		}
+		return msgReceived;
+	}
+
+	/* Send to an existing socket */
+	private Socket sendOnExistingSocket(Socket sendSocket, String messageToBeSent) throws IOException {
+		PrintWriter printWriter = null;
+		try {
+			printWriter = new PrintWriter(sendSocket.getOutputStream(), true);
+			printWriter.println(messageToBeSent);
+		} finally {
+			if (printWriter != null)
+				printWriter.close();
+			if (sendSocket != null)
+				sendSocket.close();
+
+		}
+		return sendSocket;
+	}
+
+	/* Send to new socket */
+	private Socket sendOnNewSocket(String messageToBeSent, int destinationPort) throws IOException {
 		Socket sendSocket = null;
 		try {
 			sendSocket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
 					destinationPort);
+
 			PrintWriter printWriter = new PrintWriter(sendSocket.getOutputStream(), true);
 			printWriter.println(messageToBeSent);
+
 		} catch (IOException e) {
 			Log.e("ERROR " + TAG, Log.getStackTraceString(e));
-		} finally {
-			if (sendSocket != null) {
-				try {
-					sendSocket.close();
-				} catch (IOException e) {
-					Log.e("ERROR " + TAG, Log.getStackTraceString(e));
-				}
-			}
 		}
+		return sendSocket;
 	}
 
 	public boolean amIRecovering() {
@@ -819,11 +902,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 					/* No need to check this for recovery mode, because
 					 * at a time only 1 AVD's stuff would be in this method*/
  					if (!checkLocally && resultsMap.containsKey(key)) {
-						long existingVersion = getVersion(resultsMap.get(key));
+					    String result = resultsMap.get(key);
+					    if (result != null && !result.trim().isEmpty()) {
+						    long existingVersion = getVersion(result);
 
-						/* If this version is older than the existing one, keep the existing one */
-						if (thisVersion < existingVersion)
-							value = resultsMap.get(key);
+							/* If this version is older than the existing one, keep the existing one */
+						    if (thisVersion < existingVersion)
+							    value = result;
+					    }
 					}
 
 					/* Check if a more recent version exists locally */
@@ -855,24 +941,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 	}
 
-	private void deleteThisFile(String key) {
-		//context.deleteFile(key);
-		boolean deleted = false, exists;
-
-		File file = context.getFileStreamPath(key);
-		exists = file.exists();
-		if (exists)
-			deleted = file.delete();
-
-		if (!deleted && exists)
-			Log.e("ERROR " + TAG, "Unable to delete file: " + key);
-	}
-
 	public enum Mode {
-		JOIN_REQUEST, JOIN_RESPONSE,
-		SEND_JOIN_RESPONSE, SEND_JOIN_REQUEST,
-		INSERT_REQUEST, DO_INSERTION,
-		QUERY_FIND_REQUEST, QUERY_RESULT_FOUND, QUERY_STAR_REQUEST, DO_STAR_QUERY,
+		JOIN_REQUEST, JOIN_RESPONSE, SEND_JOIN_RESPONSE, SEND_JOIN_REQUEST,
+		INSERT_REQUEST, QUERY_FIND_REQUEST, QUERY_RESULT_FOUND, QUERY_STAR_REQUEST, DO_STAR_QUERY,
 		DELETE_STAR_REQUEST, DELETE_SINGLE_KEY_REQUEST,
 		ACK_FOR_INSERT, ACK_FOR_QUERY,
 		REQUEST_RECOVERY_INFO, RECOVERY_INFORMATION, DO_RECOVERY
